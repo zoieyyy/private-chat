@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notes: File-Over-App</title>
+    <style>
+        :root[data-theme="light"] {
+            --bg-app: #f7f9fc;
+            --bg-sidebar: #ffffff;
+            --bg-card: #ffffff;
+            --border-color: #e2e8f0;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --primary: #3b82f6;
+            --danger: #ef4444;
+            --hover-bg: #f8fafc;
+            --active-bg: #eff6ff;
+            --active-border: #3b82f6;
+            --toast-bg: #1e293b;
+            --toast-text: #f8fafc;
+        }
+
+        :root[data-theme="dark"] {
+            --bg-app: #0f172a;
+            --bg-sidebar: #1e293b;
+            --bg-card: #1e293b;
+            --border-color: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --danger: #ef4444;
+            --hover-bg: #334155;
+            --active-bg: #0f172a;
+            --active-border: #3b82f6;
+            --toast-bg: #f8fafc;
+            --toast-text: #0f172a;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex; height: 100vh; overflow: hidden;
+            background-color: var(--bg-app); color: var(--text-main);
+            transition: background-color 0.2s, color 0.2s;
+        }
+
+        /* Sidebar */
+        #sidebar {
+            width: 300px; background: var(--bg-sidebar); display: flex; flex-direction: column;
+            border-right: 1px solid var(--border-color); flex-shrink: 0; z-index: 10;
+        }
+
+        .sidebar-header { padding: 16px; border-bottom: 1px solid var(--border-color); }
+        .header-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .header-top h3 { font-size: 16px; font-weight: 600; }
+
+        .action-group button {
+            background: transparent; border: 1px solid var(--border-color); color: var(--text-main);
+            padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px;
+        }
+        .action-group button:hover { background: var(--hover-bg); }
+
+        .search-box {
+            width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px;
+            font-size: 13px; outline: none; background: transparent; color: var(--text-main);
+        }
+        .search-box:focus { border-color: var(--primary); }
+
+        #tree-container { overflow-y: auto; flex-grow: 1; padding: 10px 0; }
+
+        .folder-header {
+            padding: 6px 12px; display: flex; justify-content: space-between; align-items: center;
+            cursor: pointer; font-weight: 600; font-size: 13px; color: var(--text-muted); user-select: none;
+        }
+        .folder-header:hover, .folder-header:focus { background: var(--hover-bg); color: var(--text-main); outline: none; }
+
+        .folder-title { display: flex; align-items: center; gap: 6px; flex-grow: 1; overflow: hidden; }
+        .chevron { width: 12px; text-align: center; font-size: 10px; }
+        .folder-name-input { background: transparent; border: 1px solid var(--primary); color: var(--text-main); font-size: 13px; font-weight: 600; width: 100%; outline: none; }
+
+        .folder-actions { display: none; gap: 4px; }
+        .folder-header:hover .folder-actions, .folder-header:focus-within .folder-actions { display: flex; }
+        .icon-btn { background: none; border: none; cursor: pointer; color: var(--text-muted); font-size: 12px; padding: 2px; }
+        .icon-btn:hover { color: var(--text-main); }
+        .icon-btn.delete:hover { color: var(--danger); }
+
+        .notes-list { list-style: none; display: none; }
+        .notes-list.expanded { display: block; }
+
+        .note-item { padding: 10px 12px 10px 30px; cursor: pointer; border-left: 3px solid transparent; outline: none; }
+        .note-item:hover, .note-item:focus { background: var(--hover-bg); }
+        .note-item.active { background: var(--active-bg); border-left-color: var(--active-border); }
+        .note-item-title { font-size: 14px; font-weight: 500; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .note-item-meta { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .empty-folder { padding: 8px 12px 8px 30px; font-size: 12px; color: var(--text-muted); font-style: italic; }
+
+        /* Editor Area */
+        #editor-wrapper { flex-grow: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
+        #empty-state-view { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-muted); z-index: 5; }
+        #editor-view { display: flex; flex-direction: column; height: 100%; padding: 32px; overflow-y: auto; visibility: hidden; }
+
+        .editor-card {
+            background: var(--bg-card); border-radius: 8px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+            padding: 40px; max-width: 800px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; flex-grow: 1; min-height: 500px;
+        }
+
+        .editor-top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; font-size: 13px; }
+        .folder-select { border: 1px solid var(--border-color); background: transparent; color: var(--text-muted); padding: 4px 8px; border-radius: 4px; outline: none; }
+
+        #note-title { font-size: 32px; font-weight: 700; border: none; outline: none; margin-bottom: 16px; color: var(--text-main); background: transparent; font-family: inherit; }
+        #note-content { flex-grow: 1; font-size: 16px; line-height: 1.6; border: none; outline: none; resize: none; color: var(--text-main); background: transparent; font-family: inherit; }
+
+        #preview-layer { flex-grow: 1; font-size: 16px; line-height: 1.6; display: none; color: var(--text-main); overflow-y: auto; }
+        #preview-layer h1 { font-size: 24px; margin-bottom: 10px; }
+        #preview-layer h2 { font-size: 20px; margin-bottom: 8px; }
+        #preview-layer p { margin-bottom: 12px; }
+
+        .editor-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border-color); font-size: 12px; color: var(--text-muted); }
+        .editor-footer button { background: var(--danger); color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+
+        /* Toast */
+        #toast {
+            position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(100px);
+            background: var(--toast-bg); color: var(--toast-text); padding: 12px 24px; border-radius: 8px;
+            font-size: 14px; display: flex; gap: 16px; align-items: center; transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); z-index: 100;
+        }
+        #toast.visible { transform: translateX(-50%) translateY(0); }
+        #toast button { background: transparent; border: none; color: var(--primary); font-weight: bold; cursor: pointer; }
+
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <div class="sidebar-header">
+            <div class="header-top">
+                <h3>Workspace</h3>
+                <div class="action-group">
+                    <button onclick="createFolder()">+ Folder</button>
+                    <button onclick="createNote()" style="background: var(--primary); color: white; border: none;">+ Note</button>
+                </div>
+            </div>
+            <input type="text" id="search-input" class="search-box" placeholder="Search (Cmd+/)..." oninput="handleSearch()">
+            <div class="action-group" style="margin-top: 8px; display: flex; gap: 4px;">
+                <button onclick="exportSelfContainedHtml()">Download App</button>
+                <button id="theme-toggle" onclick="toggleTheme()">Dark Mode</button>
+            </div>
+        </div>
+        <div id="tree-container"></div>
+    </div>
+
+    <div id="editor-wrapper">
+        <div id="empty-state-view">
+            <h2>No Note Selected</h2>
+            <p style="margin-top: 8px;">Select a note or hit Cmd+N to create one.</p>
+        </div>
+
+        <div id="editor-view">
+            <div class="editor-card">
+                <div class="editor-top-bar">
+                    <select id="folder-select" class="folder-select" onchange="moveNote()"></select>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <label><input type="checkbox" id="preview-toggle" onchange="togglePreview()"> Preview</label>
+                        <span id="save-status">Saved</span>
+                    </div>
+                </div>
+                <input type="text" id="note-title" placeholder="Note Title" oninput="handleInput()">
+                <textarea id="note-content" placeholder="Start typing (Markdown supported)..." oninput="handleInput()"></textarea>
+                <div id="preview-layer"></div>
+                <div class="editor-footer">
+                    <span id="word-count">0 words</span>
+                    <button onclick="softDeleteActiveNote()">Delete Note</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast">
+        <span id="toast-msg">Note deleted.</span>
+        <button onclick="undoDelete()">Undo</button>
+    </div>
+
+    <script id="app-data" type="application/json">null</script>
+
+    <script>
+        // --- Architecture: Redux-Lite Store ---
+        function createStore(initialState) {
+            let state = initialState;
+            const listeners = new Set();
+            return {
+                getState: () => state,
+                dispatch: (action) => {
+                    state = rootReducer(state, action);
+                    saveToStorage(state); // Sync local persistence
+                    syncChannel.postMessage(action); // Broadcast to tabs
+                    listeners.forEach(fn => fn(state, action));
+                },
+                dispatchFromSync: (action) => { // Receive from other tabs without re-broadcasting
+                    state = rootReducer(state, action);
+                    listeners.forEach(fn => fn(state, action));
+                },
+                subscribe: (fn) => { listeners.add(fn); return () => listeners.delete(fn); }
+            };
+        }
+
+        // --- Data Layer & Reducers ---
+        const generateId = () => (crypto.randomUUID
+            ? crypto.randomUUID()
+            : 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+        const now = () => Date.now();
+
+        // Reducers must stay pure and deterministic: ids and timestamps are generated
+        // in the action creators (createNote/createFolder/etc.), never in here.
+        // Actions are replayed verbatim in other tabs via BroadcastChannel, so a
+        // reducer-side generateId() would create a *different* note in each tab.
+        function rootReducer(state, action) {
+            switch(action.type) {
+                case 'NOTE_CREATE': {
+                    const folderId = action.folderId || state.folders[0]?.id;
+                    const newNote = { id: action.id, folderId, title: "", content: "", updatedAt: action.at, deletedAt: null };
+                    return {
+                        ...state,
+                        notes: [newNote, ...state.notes],
+                        // Expand the target folder so the new note is visible immediately
+                        folders: state.folders.map(f => f.id === folderId ? { ...f, isExpanded: true } : f),
+                        activeNoteId: action.id,
+                        searchQuery: ''
+                    };
+                }
+                case 'NOTE_UPDATE':
+                    return { ...state, notes: state.notes.map(n => n.id === action.id ? { ...n, ...action.patch, updatedAt: action.at } : n) };
+                case 'NOTE_DELETE':
+                    return { ...state, activeNoteId: state.activeNoteId === action.id ? null : state.activeNoteId, notes: state.notes.map(n => n.id === action.id ? { ...n, deletedAt: action.at } : n) };
+                case 'NOTE_RESTORE': {
+                    const note = state.notes.find(n => n.id === action.id);
+                    if (!note) return state;
+                    // If the note's folder was deleted in the meantime, re-home it so it doesn't become unreachable
+                    const folderId = state.folders.some(f => f.id === note.folderId) ? note.folderId : state.folders[0]?.id;
+                    return {
+                        ...state,
+                        activeNoteId: action.id,
+                        notes: state.notes.map(n => n.id === action.id ? { ...n, deletedAt: null, folderId } : n),
+                        folders: state.folders.map(f => f.id === folderId ? { ...f, isExpanded: true } : f)
+                    };
+                }
+                case 'NOTE_SELECT':
+                    return { ...state, activeNoteId: action.id };
+                case 'FOLDER_CREATE':
+                    return { ...state, folders: [...state.folders, { id: action.id, name: "New Folder", isExpanded: true }] };
+                case 'FOLDER_UPDATE':
+                    return { ...state, folders: state.folders.map(f => f.id === action.id ? { ...f, ...action.patch } : f) };
+                case 'FOLDER_DELETE':
+                    if (state.folders.length <= 1) return state; // never allow zero folders
+                    return { ...state, folders: state.folders.filter(f => f.id !== action.id), notes: state.notes.map(n => n.folderId === action.id ? { ...n, deletedAt: action.at } : n), activeNoteId: null };
+                case 'UI_SEARCH':
+                    return { ...state, searchQuery: action.query };
+                default:
+                    return state;
+            }
+        }
+
+        // --- Initialization & Boot ---
+        function loadBootState() {
+            // Both sources are consulted and the freshest one wins (savedAt is stamped on
+            // every persist). Previously the embedded JSON always won, which meant edits
+            // made inside an exported file were silently thrown away on reload.
+            let embedded = null, local = null;
+            try {
+                const e = JSON.parse(document.getElementById('app-data').textContent);
+                if (e && e.folders) embedded = e;
+            } catch(err) {}
+            try {
+                const l = JSON.parse(localStorage.getItem('v4_store'));
+                if (l && l.folders) local = l;
+            } catch(err) {}
+
+            if (embedded && local) return (embedded.savedAt || 0) > (local.savedAt || 0) ? embedded : local;
+            if (embedded || local) return embedded || local;
+
+            return { folders: [{ id: generateId(), name: "General", isExpanded: true }], notes: [], activeNoteId: null, searchQuery: '' };
+        }
+
+        let store;
+        const syncChannel = 'BroadcastChannel' in window
+            ? new BroadcastChannel('notes_v4_sync')
+            : { postMessage() {}, onmessage: null };
+        let lastDeletedNoteId = null;
+        let toastTimeout;
+        const TRASH_TTL_MS = 7 * 24 * 60 * 60 * 1000; // purge soft-deleted notes after 7 days
+
+        function init() {
+            let initialState = loadBootState();
+
+            // Guarantee at least one folder exists
+            if (!Array.isArray(initialState.folders) || initialState.folders.length === 0) {
+                initialState.folders = [{ id: generateId(), name: "General", isExpanded: true }];
+            }
+            if (!Array.isArray(initialState.notes)) initialState.notes = [];
+            if (typeof initialState.searchQuery !== 'string') initialState.searchQuery = '';
+
+            // Purge expired trash, sweep orphans, backfill timestamps
+            initialState.notes = initialState.notes.filter(n => !n.deletedAt || (now() - n.deletedAt) < TRASH_TTL_MS);
+            initialState.notes.forEach(n => {
+                if (!n.updatedAt) n.updatedAt = now();
+                if (!initialState.folders.some(f => f.id === n.folderId)) n.folderId = initialState.folders[0]?.id;
+            });
+
+            store = createStore(initialState);
+
+            // Subscriptions
+            store.subscribe((state, action) => {
+                // NOTE_UPDATE is the hot path (fires on every keystroke), so it only patches
+                // the sidebar item in place — unless the folder changed, which requires the
+                // note to move between lists and therefore a full tree render.
+                const isLightweightUpdate = action.type === 'NOTE_UPDATE' && !('folderId' in (action.patch || {}));
+                if (isLightweightUpdate) {
+                    patchSidebarItem(state, action.id);
+                } else {
+                    renderTree(state);
+                }
+                patchEditorState(state);
+            });
+
+            syncChannel.onmessage = (e) => store.dispatchFromSync(e.data);
+
+            // Initial render
+            const state = store.getState();
+            if (localStorage.getItem('v4_theme') === 'dark') toggleTheme(true);
+            renderTree(state);
+            patchEditorState(state);
+        }
+
+        // --- Actions & Dispatchers ---
+        const dispatch = (action) => store.dispatch(action);
+
+        function createNote(folderId) {
+            dispatch({ type: 'NOTE_CREATE', id: generateId(), folderId, at: now() });
+        }
+
+        function createFolder() {
+            dispatch({ type: 'FOLDER_CREATE', id: generateId() });
+        }
+
+        function handleInput() {
+            const state = store.getState();
+            if (!state.activeNoteId) return;
+            const titleVal = document.getElementById('note-title').value;
+            const contentVal = document.getElementById('note-content').value;
+            dispatch({ type: 'NOTE_UPDATE', id: state.activeNoteId, patch: { title: titleVal, content: contentVal }, at: now() });
+        }
+
+        function handleSearch() {
+            dispatch({ type: 'UI_SEARCH', query: document.getElementById('search-input').value.toLowerCase() });
+        }
+
+        function moveNote() {
+            const state = store.getState();
+            if(state.activeNoteId) dispatch({ type: 'NOTE_UPDATE', id: state.activeNoteId, patch: { folderId: document.getElementById('folder-select').value }, at: now() });
+        }
+
+        function softDeleteActiveNote() {
+            const state = store.getState();
+            if(state.activeNoteId) {
+                lastDeletedNoteId = state.activeNoteId;
+                dispatch({ type: 'NOTE_DELETE', id: state.activeNoteId, at: now() });
+                showToast();
+            }
+        }
+
+        function undoDelete() {
+            if(lastDeletedNoteId) {
+                dispatch({ type: 'NOTE_RESTORE', id: lastDeletedNoteId });
+                document.getElementById('toast').classList.remove('visible');
+                lastDeletedNoteId = null;
+            }
+        }
+
+        function startFolderRename(folderId, currentName) {
+            const titleDiv = document.querySelector(`.folder-header[data-id="${folderId}"] .folder-title`);
+            if(!titleDiv) return;
+            titleDiv.textContent = '';
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'folder-name-input';
+            // Assigning the value property (instead of interpolating into innerHTML)
+            // means quotes/angle brackets in folder names cannot inject markup.
+            input.value = currentName;
+            titleDiv.appendChild(input);
+            input.focus();
+            input.select();
+
+            // Guard against double-dispatch: Enter triggers a re-render which removes
+            // the input, which fires blur — without the flag we'd save twice.
+            let done = false;
+            const finish = (save) => {
+                if (done) return;
+                done = true;
+                const newName = save ? (input.value.trim() || currentName) : currentName;
+                dispatch({ type: 'FOLDER_UPDATE', id: folderId, patch: { name: newName } });
+            };
+            input.onblur = () => finish(true);
+            input.onclick = (e) => e.stopPropagation();
+            input.onkeydown = (e) => {
+                e.stopPropagation(); // keep Enter/Escape from toggling the folder or the global handler
+                if (e.key === 'Enter') finish(true);
+                if (e.key === 'Escape') finish(false);
+            };
+        }
+
+        // --- Renderers ---
+        function renderTree(state) {
+            // Keep the search box in sync with state (e.g. NOTE_CREATE clears the query)
+            const searchInput = document.getElementById('search-input');
+            if (document.activeElement !== searchInput) searchInput.value = state.searchQuery;
+
+            const container = document.getElementById('tree-container');
+            container.innerHTML = '';
+            const activeNotes = state.notes.filter(n => !n.deletedAt);
+
+            const visibleNotes = activeNotes.filter(n =>
+                state.searchQuery === "" ||
+                (n.title && n.title.toLowerCase().includes(state.searchQuery)) ||
+                (n.content && n.content.toLowerCase().includes(state.searchQuery))
+            );
+
+            state.folders.forEach(folder => {
+                const folderNotes = visibleNotes.filter(n => n.folderId === folder.id);
+                if (state.searchQuery !== "" && folderNotes.length === 0) return;
+
+                const wrapper = document.createElement('div');
+                const header = document.createElement('div');
+                header.className = 'folder-header';
+                header.dataset.id = folder.id;
+                header.tabIndex = 0;
+
+                const isExpanded = state.searchQuery !== "" ? true : folder.isExpanded;
+
+                const titleDiv = document.createElement('div');
+                titleDiv.className = 'folder-title';
+                const chevron = document.createElement('span');
+                chevron.className = 'chevron';
+                chevron.textContent = isExpanded ? '▾' : '▸';
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = folder.name;
+                titleDiv.append(chevron, nameSpan);
+
+                const actions = document.createElement('div');
+                actions.className = 'folder-actions';
+
+                const addBtn = document.createElement('button');
+                addBtn.className = 'icon-btn'; addBtn.textContent = '+'; addBtn.title = 'Add Note Here';
+                addBtn.onclick = (e) => { e.stopPropagation(); createNote(folder.id); };
+
+                const editBtn = document.createElement('button');
+                editBtn.className = 'icon-btn'; editBtn.textContent = '✎'; editBtn.title = 'Rename';
+                editBtn.onclick = (e) => { e.stopPropagation(); startFolderRename(folder.id, folder.name); };
+
+                const delBtn = document.createElement('button');
+                delBtn.className = 'icon-btn delete'; delBtn.textContent = '✕'; delBtn.title = 'Delete';
+                delBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (store.getState().folders.length <= 1) { alert('Cannot delete the last folder.'); return; }
+                    if (confirm('Delete folder and notes?')) dispatch({ type: 'FOLDER_DELETE', id: folder.id, at: now() });
+                };
+
+                actions.append(addBtn, editBtn, delBtn);
+                header.append(titleDiv, actions);
+
+                const toggle = () => { if(store.getState().searchQuery === "") dispatch({type: 'FOLDER_UPDATE', id: folder.id, patch: {isExpanded: !folder.isExpanded}}); };
+                header.onclick = toggle;
+                header.onkeydown = (e) => { if(e.key === 'Enter') toggle(); };
+
+                wrapper.appendChild(header);
+
+                const list = document.createElement('ul');
+                list.className = `notes-list ${isExpanded ? 'expanded' : ''}`;
+
+                if (folderNotes.length === 0) {
+                    list.innerHTML = `<li class="empty-folder">No notes inside</li>`;
+                } else {
+                    folderNotes.sort((a, b) => b.updatedAt - a.updatedAt).forEach(note => {
+                        const li = document.createElement('li');
+                        li.className = `note-item ${note.id === state.activeNoteId ? 'active' : ''}`;
+                        li.dataset.id = note.id; li.tabIndex = 0;
+
+                        const title = document.createElement('div'); title.className = 'note-item-title'; title.textContent = note.title || "Untitled Note";
+                        const meta = document.createElement('div'); meta.className = 'note-item-meta';
+                        meta.textContent = `${new Date(note.updatedAt).toLocaleDateString()} · ${noteSnippet(note)}`;
+
+                        li.append(title, meta);
+                        const select = (e) => { e.stopPropagation(); dispatch({type: 'NOTE_SELECT', id: note.id}); };
+                        li.onclick = select; li.onkeydown = (e) => { if(e.key === 'Enter') select(e); };
+                        list.appendChild(li);
+                    });
+                }
+                wrapper.appendChild(list);
+                container.appendChild(wrapper);
+            });
+        }
+
+        function noteSnippet(note) {
+            if (!note.content) return "Empty note";
+            const flat = note.content.replace(/\s+/g, ' ').trim();
+            return flat.substring(0, 30) + (flat.length > 30 ? "..." : "");
+        }
+
+        // Targeted DOM patcher for typing performance
+        function patchSidebarItem(state, id) {
+            const note = state.notes.find(n => n.id === id);
+            const li = document.querySelector(`.note-item[data-id="${id}"]`);
+            if(note && li) {
+                li.querySelector('.note-item-title').textContent = note.title || "Untitled Note";
+                li.querySelector('.note-item-meta').textContent = `${new Date(note.updatedAt).toLocaleDateString()} · ${noteSnippet(note)}`;
+            }
+        }
+
+        function patchEditorState(state) {
+            const emptyView = document.getElementById('empty-state-view');
+            const editorView = document.getElementById('editor-view');
+            const note = state.notes.find(n => n.id === state.activeNoteId && !n.deletedAt);
+
+            if (note) {
+                emptyView.style.display = 'none'; editorView.style.visibility = 'visible';
+
+                // Only update inputs if they are not currently focused (prevents cursor jumping)
+                const titleInput = document.getElementById('note-title');
+                const contentInput = document.getElementById('note-content');
+                if (document.activeElement !== titleInput) titleInput.value = note.title;
+                if (document.activeElement !== contentInput) contentInput.value = note.content;
+
+                // Don't rebuild the dropdown under the user's cursor while it's open
+                const select = document.getElementById('folder-select');
+                if (document.activeElement !== select) {
+                    select.options.length = 0; // Clear XSS safely
+                    state.folders.forEach(f => select.options.add(new Option(f.name, f.id)));
+                    select.value = note.folderId;
+                }
+
+                const words = note.content.trim().split(/\s+/).filter(w => w.length > 0).length;
+                document.getElementById('word-count').textContent = `${words} word${words === 1 ? '' : 's'}`;
+
+                // Keep the preview in sync when typing or switching notes
+                if (document.getElementById('preview-toggle').checked) renderMarkdown();
+            } else {
+                emptyView.style.display = 'flex'; editorView.style.visibility = 'hidden';
+            }
+        }
+
+        // --- Utilities ---
+        function saveToStorage(state) {
+            // Because localStorage is synchronous, saving on every stroke is safe from data-loss.
+            // Performance is maintained because we only patch the DOM instead of re-rendering.
+            // savedAt lets loadBootState pick the freshest of embedded JSON vs localStorage.
+            try {
+                localStorage.setItem('v4_store', JSON.stringify({ ...state, savedAt: now() }));
+            } catch(e) {
+                // Quota exceeded or storage unavailable (private mode) — the in-memory
+                // state and the "Download App" export still work.
+            }
+        }
+
+        function showToast() {
+            const toast = document.getElementById('toast');
+            toast.classList.add('visible');
+            clearTimeout(toastTimeout);
+            toastTimeout = setTimeout(() => toast.classList.remove('visible'), 5000);
+        }
+
+        function toggleTheme(forceDark) {
+            const isDark = typeof forceDark === 'boolean' ? forceDark : document.documentElement.getAttribute('data-theme') === 'light';
+            document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+            localStorage.setItem('v4_theme', isDark ? 'dark' : 'light');
+            document.getElementById('theme-toggle').textContent = isDark ? 'Light Mode' : 'Dark Mode';
+        }
+
+        function togglePreview() {
+            const isPreview = document.getElementById('preview-toggle').checked;
+            document.getElementById('note-content').style.display = isPreview ? 'none' : 'block';
+            document.getElementById('preview-layer').style.display = isPreview ? 'block' : 'none';
+            if (isPreview) renderMarkdown();
+        }
+
+        function escapeHtml(s) {
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function safeUrl(url) {
+            return /^(https?:|mailto:)/i.test(url.trim()) ? url : '#';
+        }
+
+        function renderMarkdown() {
+            const val = document.getElementById('note-content').value;
+            // HTML is escaped *before* the markdown pass so note content can never
+            // inject live markup into the preview layer. Link targets are restricted
+            // to http(s)/mailto to block javascript: URLs.
+            const html = escapeHtml(val)
+                .replace(/^### (.*$)/gim, '<h3>$1</h3>')
+                .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+                .replace(/^# (.*$)/gim, '<h1>$1</h1>')
+                .replace(/\*\*(.*?)\*\*/gim, '<b>$1</b>')
+                .replace(/\*(.*?)\*/gim, '<i>$1</i>')
+                .replace(/\[([^\]]+)\]\(([^)]+)\)/gim, (m, text, url) => `<a href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--primary)">${text}</a>`)
+                .replace(/\n/gim, '<br>');
+            document.getElementById('preview-layer').innerHTML = html;
+        }
+
+        // The "File-Over-App" Export Engine
+        function exportSelfContainedHtml() {
+            const html = document.documentElement.cloneNode(true);
+            const dataScript = html.querySelector('#app-data');
+
+            // Inject current memory state into the DOM clone. Escaping "<" as \u003c
+            // keeps a literal closing script tag inside note content from terminating
+            // the data script tag and corrupting the exported file (JSON.parse still
+            // decodes \u003c transparently).
+            dataScript.textContent = JSON.stringify({ ...store.getState(), savedAt: now() }).replace(/</g, '\\u003c');
+
+            // Strip transient UI so the export is clean; init() re-renders on boot.
+            html.querySelector('#tree-container').innerHTML = '';
+            html.querySelector('#toast').classList.remove('visible');
+
+            const blob = new Blob(['<!DOCTYPE html>\n' + html.outerHTML], {type: 'text/html'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `notes_v4_${new Date().toISOString().split('T')[0]}.html`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        // Global Keyboard Shortcuts
+        document.addEventListener('keydown', (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'n') { e.preventDefault(); createNote(); document.getElementById('note-title').focus(); }
+            if ((e.metaKey || e.ctrlKey) && e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
+            if (e.key === 'Escape') {
+                // Only intercept Escape while searching — a global blur/clear would
+                // steal Escape from the editor and the folder-rename input.
+                const search = document.getElementById('search-input');
+                if (document.activeElement === search) {
+                    e.preventDefault();
+                    search.value = '';
+                    dispatch({type: 'UI_SEARCH', query: ''});
+                    search.blur();
+                }
+            }
+        });
+
+        init();
+    </script>
+</body>
+</html>
