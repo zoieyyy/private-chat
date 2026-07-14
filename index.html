@@ -129,6 +129,56 @@
         #toast.visible { transform: translateX(-50%) translateY(0); }
         #toast button { background: transparent; border: none; color: var(--primary); font-weight: bold; cursor: pointer; }
 
+        /* Modal */
+        #modal-root {
+            position: fixed; inset: 0; z-index: 200;
+            display: none; align-items: center; justify-content: center;
+            background: rgba(15, 23, 42, 0.55);
+        }
+        #modal-root.open { display: flex; }
+        .modal-dialog {
+            background: var(--bg-card); color: var(--text-main);
+            border-radius: 10px; box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+            min-width: 340px; max-width: 480px; max-height: 90vh; width: calc(100% - 32px);
+            display: flex; flex-direction: column; overflow: hidden;
+            border: 1px solid var(--border-color);
+            animation: modal-in 0.15s ease-out;
+        }
+        @keyframes modal-in { from { transform: translateY(8px); opacity: 0.6; } to { transform: none; opacity: 1; } }
+        .modal-header { padding: 20px 24px 8px; }
+        .modal-title { font-size: 16px; font-weight: 600; margin: 0; }
+        .modal-body { padding: 8px 24px 12px; font-size: 14px; color: var(--text-muted); overflow-y: auto; }
+        .modal-body p { margin-bottom: 8px; line-height: 1.5; }
+        .modal-body p:last-child { margin-bottom: 0; }
+        .modal-body strong { color: var(--text-main); }
+
+        .modal-fields { padding: 4px 24px 12px; display: flex; flex-direction: column; gap: 12px; }
+        .modal-field label { display: block; font-size: 13px; margin-bottom: 4px; color: var(--text-main); font-weight: 500; }
+        .modal-field input {
+            width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px;
+            background: var(--bg-app); color: var(--text-main); font-size: 14px; outline: none; font-family: inherit;
+        }
+        .modal-field input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent); }
+        .modal-field .field-help { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+        .modal-field .field-error { font-size: 12px; color: var(--danger); margin-top: 4px; display: none; }
+        .modal-field.has-error .field-error { display: block; }
+        .modal-field.has-error input { border-color: var(--danger); }
+
+        .modal-footer {
+            padding: 12px 24px 20px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap;
+        }
+        .modal-btn {
+            padding: 8px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; font-family: inherit;
+            border: 1px solid var(--border-color); background: transparent; color: var(--text-main);
+        }
+        .modal-btn:hover { background: var(--hover-bg); }
+        .modal-btn.primary { background: var(--primary); color: white; border-color: var(--primary); }
+        .modal-btn.primary:hover { filter: brightness(0.95); }
+        .modal-btn.danger { background: var(--danger); color: white; border-color: var(--danger); }
+        .modal-btn.danger:hover { filter: brightness(0.95); }
+        .modal-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+        .modal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
     </style>
 </head>
 <body>
@@ -181,6 +231,8 @@
         <span id="toast-msg">Note deleted.</span>
         <button onclick="undoDelete()">Undo</button>
     </div>
+
+    <div id="modal-root" aria-hidden="true"></div>
 
     <script id="app-data" type="application/json">null</script>
 
@@ -349,6 +401,272 @@
             async encrypt() { throw new Error('cryptoUtils not initialized'); },
             async decrypt() { throw new Error('cryptoUtils not initialized'); }
         };
+
+        // --- Modal Component ---
+        // A single reusable focus-trapped dialog. Native confirm/alert are unusable on installed
+        // iOS PWAs (they can silently no-op) and are globally dismissible in ways that make
+        // destructive-action confirmations dangerous — a stray Enter can confirm a delete you
+        // never wanted. This component:
+        //   • role="alertdialog" with aria-labelledby / aria-describedby
+        //   • traps Tab focus inside the dialog
+        //   • Escape maps to Cancel only when a cancel button exists (`dismissible: true`)
+        //   • never auto-focuses a destructive button, so keyboard Enter can't accidentally trigger it
+        //   • marks the rest of the page `inert`, so background clicks/keys can't reach the app
+        const modal = (() => {
+            const root = document.getElementById('modal-root');
+            let currentClose = null; // resolver for the in-flight modal; null when nothing open
+
+            function backgroundEls() {
+                return Array.from(document.body.children).filter(el => el.id !== 'modal-root' && el.id !== 'toast');
+            }
+
+            function focusables(container) {
+                return Array.from(container.querySelectorAll(
+                    'input:not([disabled]), button:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+                )).filter(el => el.offsetParent !== null || el === document.activeElement);
+            }
+
+            function open(opts) {
+                if (currentClose) {
+                    // Queue: wait for the current modal to close before opening the next.
+                    return new Promise((resolve) => {
+                        const prevClose = currentClose;
+                        // Wrap by chaining after the current close resolves.
+                        // We don't cancel the pending modal — that would surprise the user.
+                        Promise.resolve().then(async () => {
+                            // Poll every 50ms — simpler than plumbing a queue, and modal churn is rare.
+                            while (currentClose) await new Promise(r => setTimeout(r, 50));
+                            resolve(await open(opts));
+                        });
+                    });
+                }
+
+                const {
+                    title = '',
+                    body = '',
+                    fields = [],
+                    buttons = [{ label: 'OK', kind: 'primary', value: true, autofocus: true }],
+                    dismissible = true,
+                    submitOnEnter = false,
+                    validate = null
+                } = opts;
+
+                return new Promise((resolve) => {
+                    root.innerHTML = '';
+                    const dialog = document.createElement('div');
+                    dialog.className = 'modal-dialog';
+                    dialog.setAttribute('role', 'alertdialog');
+                    dialog.setAttribute('aria-modal', 'true');
+
+                    const titleId = 'modal-title-' + generateId();
+                    const bodyId = 'modal-body-' + generateId();
+                    if (title) dialog.setAttribute('aria-labelledby', titleId);
+                    if (body) dialog.setAttribute('aria-describedby', bodyId);
+
+                    if (title) {
+                        const h = document.createElement('div');
+                        h.className = 'modal-header';
+                        const t = document.createElement('h2');
+                        t.className = 'modal-title'; t.id = titleId;
+                        t.textContent = title;
+                        h.appendChild(t);
+                        dialog.appendChild(h);
+                    }
+
+                    if (body) {
+                        const b = document.createElement('div');
+                        b.className = 'modal-body'; b.id = bodyId;
+                        if (typeof body === 'string') {
+                            body.split('\n\n').forEach(para => {
+                                const p = document.createElement('p');
+                                p.textContent = para;
+                                b.appendChild(p);
+                            });
+                        } else if (body instanceof Node) {
+                            b.appendChild(body);
+                        }
+                        dialog.appendChild(b);
+                    }
+
+                    const fieldEls = {};
+                    if (fields.length) {
+                        const fieldsWrap = document.createElement('div');
+                        fieldsWrap.className = 'modal-fields';
+                        fields.forEach(f => {
+                            const wrap = document.createElement('div');
+                            wrap.className = 'modal-field';
+                            const label = document.createElement('label');
+                            label.textContent = f.label || f.name;
+                            const inputId = 'modal-field-' + generateId();
+                            label.htmlFor = inputId;
+                            const input = document.createElement('input');
+                            input.id = inputId;
+                            input.type = f.type || 'text';
+                            input.autocomplete = f.autocomplete || 'off';
+                            if (f.placeholder) input.placeholder = f.placeholder;
+                            if (f.value != null) input.value = f.value;
+                            if (f.autofocus) input.dataset.autofocus = '1';
+                            wrap.appendChild(label);
+                            wrap.appendChild(input);
+                            if (f.help) {
+                                const help = document.createElement('div');
+                                help.className = 'field-help';
+                                help.textContent = f.help;
+                                wrap.appendChild(help);
+                            }
+                            const err = document.createElement('div');
+                            err.className = 'field-error';
+                            wrap.appendChild(err);
+                            fieldsWrap.appendChild(wrap);
+                            fieldEls[f.name] = { input, wrap, err };
+                        });
+                        dialog.appendChild(fieldsWrap);
+                    }
+
+                    const footer = document.createElement('div');
+                    footer.className = 'modal-footer';
+                    const btnEls = [];
+                    // Sanity: never auto-focus a destructive button, regardless of caller intent.
+                    const hasDangerAutofocus = buttons.some(b => b.autofocus && b.kind === 'danger');
+                    if (hasDangerAutofocus) console.warn('Refusing to autofocus a destructive button.');
+                    buttons.forEach(bt => {
+                        const btn = document.createElement('button');
+                        btn.className = 'modal-btn' + (bt.kind && bt.kind !== 'default' ? ' ' + bt.kind : '');
+                        btn.textContent = bt.label;
+                        btn.type = 'button';
+                        if (bt.autofocus && bt.kind !== 'danger') btn.dataset.autofocus = '1';
+                        btn.onclick = () => submit(bt.value);
+                        footer.appendChild(btn);
+                        btnEls.push({ btn, spec: bt });
+                    });
+                    dialog.appendChild(footer);
+
+                    root.appendChild(dialog);
+                    root.classList.add('open');
+                    root.setAttribute('aria-hidden', 'false');
+
+                    const prevActive = document.activeElement;
+                    const bgEls = backgroundEls();
+                    bgEls.forEach(el => el.setAttribute('inert', ''));
+
+                    const cancelBtn = btnEls.find(b => b.spec.value === false || b.spec.value == null);
+                    const cancelValue = cancelBtn ? cancelBtn.spec.value : null;
+                    const primaryBtn = btnEls.find(b => b.spec.kind === 'primary' || b.spec.kind === 'danger');
+
+                    function submit(value) {
+                        if (value === true && validate) {
+                            const vals = collectFieldValues();
+                            const errors = validate(vals);
+                            if (errors) {
+                                applyErrors(errors);
+                                return;
+                            }
+                        }
+                        cleanup();
+                        const result = { button: value };
+                        if (fields.length) result.fields = collectFieldValues();
+                        resolve(result);
+                    }
+                    function collectFieldValues() {
+                        const out = {};
+                        for (const [name, { input }] of Object.entries(fieldEls)) out[name] = input.value;
+                        return out;
+                    }
+                    function applyErrors(errors) {
+                        for (const [name, entry] of Object.entries(fieldEls)) {
+                            if (errors[name]) {
+                                entry.wrap.classList.add('has-error');
+                                entry.err.textContent = errors[name];
+                            } else {
+                                entry.wrap.classList.remove('has-error');
+                                entry.err.textContent = '';
+                            }
+                        }
+                        // Focus the first errored field for keyboard users.
+                        const first = Object.keys(errors)[0];
+                        if (first && fieldEls[first]) fieldEls[first].input.focus();
+                    }
+                    function cleanup() {
+                        root.classList.remove('open');
+                        root.setAttribute('aria-hidden', 'true');
+                        root.innerHTML = '';
+                        bgEls.forEach(el => el.removeAttribute('inert'));
+                        document.removeEventListener('keydown', onKey, true);
+                        currentClose = null;
+                        if (prevActive && typeof prevActive.focus === 'function') {
+                            try { prevActive.focus(); } catch {}
+                        }
+                    }
+                    function onKey(e) {
+                        if (e.key === 'Escape') {
+                            if (!dismissible) { e.preventDefault(); return; }
+                            e.preventDefault();
+                            submit(cancelValue);
+                            return;
+                        }
+                        if (e.key === 'Tab') {
+                            const items = focusables(dialog);
+                            if (items.length === 0) return;
+                            const first = items[0], last = items[items.length - 1];
+                            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+                            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+                            return;
+                        }
+                        if (e.key === 'Enter' && submitOnEnter && e.target.tagName === 'INPUT') {
+                            e.preventDefault();
+                            if (primaryBtn) primaryBtn.btn.click();
+                        }
+                    }
+
+                    document.addEventListener('keydown', onKey, true);
+                    currentClose = () => submit(cancelValue);
+
+                    // Initial focus: honored autofocus, else first field, else first non-destructive button.
+                    setTimeout(() => {
+                        const autofocusEl = dialog.querySelector('[data-autofocus="1"]');
+                        if (autofocusEl) { autofocusEl.focus(); return; }
+                        const firstField = dialog.querySelector('.modal-field input');
+                        if (firstField) { firstField.focus(); return; }
+                        const safeBtn = btnEls.find(b => b.spec.kind !== 'danger');
+                        if (safeBtn) safeBtn.btn.focus();
+                    }, 0);
+                });
+            }
+
+            async function confirm({ title, body, danger = false, confirmLabel = 'Confirm', cancelLabel = 'Cancel' }) {
+                const res = await open({
+                    title, body,
+                    buttons: [
+                        { label: cancelLabel, kind: 'default', value: false, autofocus: true },
+                        { label: confirmLabel, kind: danger ? 'danger' : 'primary', value: true }
+                    ],
+                    dismissible: true
+                });
+                return res.button === true;
+            }
+
+            async function alert({ title, body, okLabel = 'OK' }) {
+                await open({
+                    title, body,
+                    buttons: [{ label: okLabel, kind: 'primary', value: true, autofocus: true }],
+                    dismissible: true
+                });
+            }
+
+            async function prompt({ title, body, fields, confirmLabel = 'OK', cancelLabel = 'Cancel', danger = false, dismissible = true, validate = null }) {
+                const res = await open({
+                    title, body, fields, dismissible, submitOnEnter: true, validate,
+                    buttons: [
+                        { label: cancelLabel, kind: 'default', value: false },
+                        { label: confirmLabel, kind: danger ? 'danger' : 'primary', value: true }
+                    ]
+                });
+                if (res.button !== true) return null;
+                return res.fields;
+            }
+
+            return { open, confirm, alert, prompt };
+        })();
 
         function sanitizeState(s) {
             if (!Array.isArray(s.folders) || s.folders.length === 0) {
@@ -522,10 +840,25 @@
 
                 const delBtn = document.createElement('button');
                 delBtn.className = 'icon-btn delete'; delBtn.textContent = '✕'; delBtn.title = 'Delete';
-                delBtn.onclick = (e) => {
+                delBtn.setAttribute('aria-label', 'Delete folder ' + folder.name);
+                delBtn.onclick = async (e) => {
                     e.stopPropagation();
-                    if (store.getState().folders.length <= 1) { alert('Cannot delete the last folder.'); return; }
-                    if (confirm('Delete folder and notes?')) dispatch({ type: 'FOLDER_DELETE', id: folder.id, at: now() });
+                    if (store.getState().folders.length <= 1) {
+                        await modal.alert({ title: 'Cannot delete', body: 'You must keep at least one folder.' });
+                        return;
+                    }
+                    const notesInFolder = store.getState().notes.filter(n => n.folderId === folder.id && !n.deletedAt).length;
+                    const bodyText = notesInFolder > 0
+                        ? `"${folder.name}" contains ${notesInFolder} note${notesInFolder === 1 ? '' : 's'}. Deleting the folder moves them to the trash for 7 days before they are purged.`
+                        : `Delete the empty folder "${folder.name}"?`;
+                    const ok = await modal.confirm({
+                        title: 'Delete folder?',
+                        body: bodyText,
+                        confirmLabel: 'Delete folder',
+                        cancelLabel: 'Keep folder',
+                        danger: true
+                    });
+                    if (ok) dispatch({ type: 'FOLDER_DELETE', id: folder.id, at: now() });
                 };
 
                 actions.append(addBtn, editBtn, delBtn);
@@ -731,7 +1064,10 @@
             try {
                 payload = await buildVaultPayload(store.getState());
             } catch(err) {
-                alert('Cannot export while the vault is locked. Unlock first.');
+                await modal.alert({
+                    title: 'Vault is locked',
+                    body: 'Unlock the vault before downloading — otherwise the exported file would not contain any of your notes.'
+                });
                 return;
             }
 
