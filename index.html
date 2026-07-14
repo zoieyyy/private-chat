@@ -631,6 +631,180 @@
             saveToStorage(store.getState());
         }
 
+        // --- Passkey (WebAuthn PRF) Unlock ---
+        // Additive second unlock path. The passphrase remains the ultimate fallback — losing
+        // all passkeys is intentionally recoverable. Support is feature-detected; the button
+        // is hidden entirely on browsers/environments that don't expose WebAuthn, so users
+        // don't dead-end in a broken UI (per spec).
+        async function probePasskeySupport() {
+            if (!window.PublicKeyCredential || !navigator.credentials?.create) {
+                return { supported: false, prfLikely: false };
+            }
+            let clientCaps = null;
+            try {
+                if (typeof PublicKeyCredential.getClientCapabilities === 'function') {
+                    clientCaps = await PublicKeyCredential.getClientCapabilities();
+                }
+            } catch {}
+            // getClientCapabilities is authoritative-ish for client PRF support (Chrome 132+).
+            // Older browsers can't tell us — surface the option and discover at registration.
+            const prfLikely = clientCaps ? clientCaps.extensionPrf === true : true;
+            return { supported: true, prfLikely };
+        }
+
+        function currentRpId() {
+            // Passing rp.id explicitly on file:// (empty hostname) breaks WebAuthn. Let the
+            // browser default to the effective domain when there isn't a hostname.
+            return location.hostname && location.hostname !== '' ? location.hostname : undefined;
+        }
+
+        async function registerPasskey(label) {
+            if (!currentDek) throw new Error('Vault must be unlocked to add a passkey.');
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Enable encryption first.');
+            if (!window.PublicKeyCredential) throw new Error('WebAuthn is not available in this browser.');
+
+            const challenge = cryptoUtils.randomBytes(32);
+            const userId = cryptoUtils.randomBytes(16);
+            const prfSalt = cryptoUtils.randomBytes(32);
+            const rpId = currentRpId();
+
+            const cred = await navigator.credentials.create({
+                publicKey: {
+                    challenge,
+                    rp: { name: 'Private Notes', ...(rpId ? { id: rpId } : {}) },
+                    user: { id: userId, name: 'notes-vault', displayName: 'Notes Vault' },
+                    pubKeyCredParams: [
+                        { type: 'public-key', alg: -7 },   // ES256
+                        { type: 'public-key', alg: -257 }  // RS256
+                    ],
+                    authenticatorSelection: { userVerification: 'preferred', residentKey: 'preferred' },
+                    extensions: { prf: { eval: { first: prfSalt } } }
+                }
+            });
+            if (!cred) throw new Error('Passkey registration was cancelled.');
+
+            const clientExt = cred.getClientExtensionResults();
+            let prfOutput = clientExt?.prf?.results?.first;
+
+            // Not every authenticator exposes PRF at create() — some (iCloud Keychain,
+            // Google Password Manager) expose it only via get(). Retry once with the same
+            // salt before declaring PRF unsupported.
+            if (!prfOutput) {
+                try {
+                    const assertion = await navigator.credentials.get({
+                        publicKey: {
+                            challenge: cryptoUtils.randomBytes(32),
+                            allowCredentials: [{ id: cred.rawId, type: 'public-key' }],
+                            userVerification: 'preferred',
+                            ...(rpId ? { rpId } : {}),
+                            extensions: { prf: { eval: { first: prfSalt } } }
+                        }
+                    });
+                    prfOutput = assertion?.getClientExtensionResults()?.prf?.results?.first;
+                } catch (err) {
+                    console.warn('PRF probe on get() failed:', err);
+                }
+            }
+
+            if (!prfOutput) {
+                throw new Error('This authenticator does not support the PRF extension. Nothing was saved. Common causes: external security key on iOS Safari (platform limitation), or Windows Hello on a build older than 25H2 26200.7840.');
+            }
+
+            const hkdfSalt = cryptoUtils.randomBytes(32);
+            const kek = await cryptoUtils.deriveKekFromPrf(new Uint8Array(prfOutput), hkdfSalt);
+            const wrapped = await cryptoUtils.wrapDek(currentDek, kek);
+
+            const existing = currentVault.security.wraps?.passkeys || [];
+            const rec = {
+                credentialId: cryptoUtils.b64url.encode(new Uint8Array(cred.rawId)),
+                prfSalt: cryptoUtils.b64.encode(prfSalt),
+                hkdfSalt: cryptoUtils.b64.encode(hkdfSalt),
+                alg: 'AES-KW',
+                wrapped,
+                addedAt: now(),
+                label: label || 'Passkey'
+            };
+            currentVault = {
+                ...currentVault,
+                security: {
+                    ...currentVault.security,
+                    wraps: { ...currentVault.security.wraps, passkeys: [...existing, rec] }
+                },
+                savedAt: now()
+            };
+            saveToStorage(store.getState());
+            return rec;
+        }
+
+        async function unlockWithPasskey() {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const passkeys = currentVault.security.wraps?.passkeys || [];
+            if (passkeys.length === 0) throw new Error('No passkeys registered');
+            if (!window.PublicKeyCredential) throw new Error('WebAuthn not available in this browser');
+
+            // evalByCredential lets each registered passkey have its own PRF salt, so wraps
+            // are cryptographically independent (compromise of one PRF output doesn't imply
+            // anything about the others).
+            const evalByCredential = {};
+            const allowCredentials = passkeys.map(p => {
+                evalByCredential[p.credentialId] = { first: cryptoUtils.b64.decode(p.prfSalt) };
+                return { id: cryptoUtils.b64url.decode(p.credentialId), type: 'public-key' };
+            });
+
+            const rpId = currentRpId();
+            const assertion = await navigator.credentials.get({
+                publicKey: {
+                    challenge: cryptoUtils.randomBytes(32),
+                    allowCredentials,
+                    userVerification: 'preferred',
+                    ...(rpId ? { rpId } : {}),
+                    extensions: { prf: { evalByCredential } }
+                }
+            });
+            if (!assertion) throw new Error('Passkey assertion cancelled');
+
+            const usedCredentialId = cryptoUtils.b64url.encode(new Uint8Array(assertion.rawId));
+            const passkey = passkeys.find(p => p.credentialId === usedCredentialId);
+            if (!passkey) throw new Error('Assertion did not match a registered passkey');
+
+            const prfOutput = assertion.getClientExtensionResults()?.prf?.results?.first;
+            if (!prfOutput) throw new Error('Authenticator did not return PRF output for this credential');
+
+            const hkdfSalt = cryptoUtils.b64.decode(passkey.hkdfSalt);
+            const kek = await cryptoUtils.deriveKekFromPrf(new Uint8Array(prfOutput), hkdfSalt);
+            const dek = await cryptoUtils.unwrapDek(passkey.wrapped, kek);
+
+            const raw = readRawVault();
+            if (!raw?.ciphertext) throw new Error('Vault ciphertext missing');
+            const plaintext = await cryptoUtils.decrypt(dek, raw.ciphertext.iv, raw.ciphertext.data);
+            const state = sanitizeState(JSON.parse(plaintext));
+
+            currentDek = dek;
+            currentVault = { ...currentVault, security: raw.security || currentVault.security, savedAt: raw.savedAt || 0 };
+            applyUnlockedState(state);
+        }
+
+        async function removePasskey(credentialId) {
+            const passkeys = currentVault.security.wraps?.passkeys || [];
+            const remaining = passkeys.filter(p => p.credentialId !== credentialId);
+            currentVault = {
+                ...currentVault,
+                security: {
+                    ...currentVault.security,
+                    wraps: { ...currentVault.security.wraps, passkeys: remaining }
+                },
+                savedAt: now()
+            };
+            saveToStorage(store.getState());
+        }
+
+        function updatePasskeyButtonVisibility() {
+            const btn = document.getElementById('unlock-passkey-btn');
+            if (!btn) return;
+            const hasPasskeys = (currentVault.security?.wraps?.passkeys || []).length > 0;
+            btn.hidden = !(hasPasskeys && !!window.PublicKeyCredential);
+        }
+
         async function unlockWithPassphrase(passphrase) {
             if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
             const meta = currentVault.security;
@@ -672,8 +846,17 @@
             meta.textContent = savedAt ? `Last saved: ${savedAt}` : '';
             document.getElementById('unlock-error').textContent = '';
             document.getElementById('unlock-passphrase').value = '';
+            updatePasskeyButtonVisibility();
             // Focus after the overlay is visible; autofocus on hidden inputs is unreliable.
-            setTimeout(() => document.getElementById('unlock-passphrase').focus(), 0);
+            // Focus the passphrase field when it's visible; the passkey button when it's the only control.
+            setTimeout(() => {
+                const passphraseField = document.getElementById('unlock-passphrase-field');
+                if (passphraseField && !passphraseField.hidden) {
+                    document.getElementById('unlock-passphrase').focus();
+                } else {
+                    document.getElementById('unlock-submit').focus();
+                }
+            }, 0);
         }
 
         function hideLockOverlay() {
@@ -698,6 +881,28 @@
             const form = document.getElementById('unlock-form');
             const errEl = document.getElementById('unlock-error');
             const btn = document.getElementById('unlock-submit');
+            const passkeyBtn = document.getElementById('unlock-passkey-btn');
+            passkeyBtn.onclick = async () => {
+                errEl.textContent = '';
+                passkeyBtn.disabled = true;
+                const origLabel = passkeyBtn.textContent;
+                passkeyBtn.textContent = 'Waiting for passkey…';
+                try {
+                    await unlockWithPasskey();
+                    isLocked = false;
+                    resetIdleTimer();
+                } catch(err) {
+                    // A cancelled prompt is a common case; downgrade to a neutral message.
+                    const isCancel = /cancell|not allowed|abort/i.test(String(err.message || err));
+                    errEl.textContent = isCancel
+                        ? 'Passkey unlock cancelled. Try again or use your passphrase.'
+                        : 'Passkey unlock failed. Try your passphrase.';
+                    console.warn('Passkey unlock failed:', err);
+                } finally {
+                    passkeyBtn.disabled = false;
+                    passkeyBtn.textContent = origLabel;
+                }
+            };
             form.onsubmit = async (e) => {
                 e.preventDefault();
                 errEl.textContent = '';
@@ -928,17 +1133,100 @@
             timeoutWrap.appendChild(select);
             body.appendChild(timeoutWrap);
 
-            const choice = await modal.open({
-                title: 'Security',
-                body,
-                buttons: [
-                    { label: 'Close', kind: 'default', value: 'close', autofocus: true },
-                    { label: 'Change passphrase', kind: 'primary', value: 'change' },
-                    { label: 'Disable encryption', kind: 'danger', value: 'disable' }
-                ]
-            });
+            const support = await probePasskeySupport();
+            const buttons = [
+                { label: 'Close', kind: 'default', value: 'close', autofocus: true },
+                { label: 'Change passphrase', kind: 'primary', value: 'change' }
+            ];
+            if (support.supported) buttons.push({ label: 'Manage passkeys', kind: 'default', value: 'passkeys' });
+            buttons.push({ label: 'Disable encryption', kind: 'danger', value: 'disable' });
+
+            const choice = await modal.open({ title: 'Security', body, buttons });
             if (choice.button === 'change') await openChangePassphraseFlow();
+            if (choice.button === 'passkeys') await openManagePasskeys();
             if (choice.button === 'disable') await openDisableEncryptionFlow();
+        }
+
+        async function openManagePasskeys() {
+            const support = await probePasskeySupport();
+            const passkeys = currentVault.security?.wraps?.passkeys || [];
+
+            const body = document.createElement('div');
+            const intro = document.createElement('p');
+            intro.textContent = support.supported
+                ? 'Passkeys let you unlock without typing your passphrase. Your passphrase always still works, so losing a passkey is safe — but losing this device\'s passkey without also knowing your passphrase means permanent data loss.'
+                : 'This browser does not expose WebAuthn. Passkey unlock is not available here — use your passphrase.';
+            body.appendChild(intro);
+
+            if (passkeys.length) {
+                const list = document.createElement('ul');
+                list.style.listStyle = 'none'; list.style.padding = '0'; list.style.margin = '12px 0 0';
+                for (const pk of passkeys) {
+                    const li = document.createElement('li');
+                    li.style.display = 'flex'; li.style.justifyContent = 'space-between'; li.style.alignItems = 'center';
+                    li.style.padding = '10px 0'; li.style.borderTop = '1px solid var(--border-color)';
+                    const info = document.createElement('div');
+                    info.style.color = 'var(--text-main)';
+                    const label = document.createElement('div');
+                    label.textContent = pk.label || 'Passkey'; label.style.fontWeight = '500';
+                    const date = document.createElement('div');
+                    date.textContent = 'Added ' + new Date(pk.addedAt).toLocaleDateString();
+                    date.style.fontSize = '11px'; date.style.color = 'var(--text-muted)';
+                    info.appendChild(label); info.appendChild(date);
+                    const rm = document.createElement('button');
+                    rm.className = 'modal-btn'; rm.textContent = 'Remove';
+                    rm.onclick = async () => {
+                        const ok = await modal.confirm({
+                            title: 'Remove passkey?',
+                            body: `Remove "${pk.label || 'this passkey'}"? Your passphrase (and any other registered passkeys) will still unlock the vault.`,
+                            danger: true,
+                            confirmLabel: 'Remove passkey'
+                        });
+                        if (ok) {
+                            await removePasskey(pk.credentialId);
+                            // The current modal is already open; close and reopen so the list reflects the change.
+                            document.querySelector('#modal-root .modal-btn')?.click();
+                            openManagePasskeys();
+                        }
+                    };
+                    li.appendChild(info); li.appendChild(rm);
+                    list.appendChild(li);
+                }
+                body.appendChild(list);
+            } else if (support.supported) {
+                const empty = document.createElement('p');
+                empty.textContent = 'No passkeys registered yet.';
+                empty.style.marginTop = '8px';
+                body.appendChild(empty);
+            }
+
+            const choice = await modal.open({
+                title: 'Passkeys',
+                body,
+                buttons: support.supported
+                    ? [
+                        { label: 'Close', kind: 'default', value: 'close', autofocus: true },
+                        { label: 'Add passkey', kind: 'primary', value: 'add' }
+                    ]
+                    : [{ label: 'Close', kind: 'default', value: 'close', autofocus: true }]
+            });
+            if (choice.button === 'add') await addPasskeyFlow();
+        }
+
+        async function addPasskeyFlow() {
+            const fields = await modal.prompt({
+                title: 'Add a passkey',
+                body: 'Use your device biometric or security key to unlock without typing your passphrase.\n\nLosing this device\'s passkey without also knowing your passphrase means permanent data loss for anyone who relies on that passkey alone.',
+                fields: [{ name: 'label', label: 'Label', type: 'text', value: '', placeholder: 'e.g. MacBook, iPhone', autofocus: true }],
+                confirmLabel: 'Register'
+            });
+            if (!fields) return;
+            try {
+                await registerPasskey(fields.label || 'Passkey');
+                await modal.alert({ title: 'Passkey registered', body: 'You can now unlock this vault with your passkey.' });
+            } catch (err) {
+                await modal.alert({ title: 'Registration failed', body: String(err.message || err) });
+            }
         }
 
         async function openChangePassphraseFlow() {
