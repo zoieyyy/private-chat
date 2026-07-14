@@ -17,7 +17,7 @@
       - frame-ancestors is header-only; it's applied via server config, not meta.
       - object/base locked down to prevent embedding attacks and base tricks.
     -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-gxwbItViGI8mQe/Tvk8hjzN8s2NiKUWE0QNT++qt28o='; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-EKmDbibLmyCTPr4fO2s4CGdebvE5FGeQPm/IhnPiccY='; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'">
     <title>Notes: File-Over-App</title>
     <style>
         :root[data-theme="light"] {
@@ -420,7 +420,7 @@
                 if (e && (e.folders || e.vaultVersion)) embedded = e;
             } catch(err) {}
             try {
-                const l = JSON.parse(localStorage.getItem(VAULT_KEY));
+                const l = JSON.parse(safeStorage.get(VAULT_KEY));
                 if (l && (l.folders || l.vaultVersion)) local = l;
             } catch(err) {}
             if (embedded && local) return (embedded.savedAt || 0) > (local.savedAt || 0) ? embedded : local;
@@ -621,12 +621,11 @@
             const meta = currentVault.security;
             const salt = cryptoUtils.b64.decode(meta.kdf.salt);
             const kek = await cryptoUtils.deriveKekFromPassphrase(passphrase, salt, meta.kdf.iterations);
-            // Verify by unwrapping; wrong passphrase throws.
-            const dek = await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, kek);
-            // Keep the (still-decrypted) current state in memory; just flip modes and re-save.
-            currentDek = dek;
-            currentVault = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: now() };
+            // Unwrap purely to verify the passphrase; wrong passphrase throws. The current state
+            // is already decrypted in memory, so flipping to plain and re-saving needs no DEK.
+            await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, kek);
             currentDek = null;
+            currentVault = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: now() };
             saveToStorage(store.getState());
             renderTree(store.getState());
             resetIdleTimer();
@@ -894,7 +893,6 @@
         }
 
         function applyUnlockedState(state) {
-            const s = store.getState();
             // Replace the store's state wholesale by dispatching a synthetic action. Using the
             // reducer keeps subscribers wired; using the sync channel would leak plaintext to
             // other tabs, so we skip broadcast here — each tab unlocks independently.
@@ -1078,7 +1076,7 @@
             if (currentVault.security?.mode === 'encrypted' && currentDek) {
                 try {
                     const payload = await buildVaultPayload(store.getState());
-                    localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
+                    safeStorage.set(VAULT_KEY, JSON.stringify(payload));
                     currentVault.savedAt = payload.savedAt;
                 } catch(err) {
                     console.warn('Failed to flush before lock:', err);
@@ -1154,7 +1152,7 @@
             // this is where they'll actually go looking for it.
             const body = document.createElement('div');
             const p = document.createElement('p');
-            p.innerHTML = 'Encryption is on. Your notes are stored as AES-256-GCM ciphertext in this browser and in any downloaded exports.';
+            p.textContent = 'Encryption is on. Your notes are stored as AES-256-GCM ciphertext in this browser and in any downloaded exports.';
             body.appendChild(p);
 
             const timeoutWrap = document.createElement('div');
@@ -1179,12 +1177,15 @@
             timeoutWrap.appendChild(select);
             body.appendChild(timeoutWrap);
 
+            // Hide the passkey option entirely when WebAuthn is missing or the client reports
+            // PRF as definitively unsupported — per spec, don't dead-end users in a broken UI.
             const support = await probePasskeySupport();
+            const passkeysAvailable = support.supported && support.prfLikely;
             const buttons = [
                 { label: 'Close', kind: 'default', value: 'close', autofocus: true },
                 { label: 'Change passphrase', kind: 'primary', value: 'change' }
             ];
-            if (support.supported) buttons.push({ label: 'Manage passkeys', kind: 'default', value: 'passkeys' });
+            if (passkeysAvailable) buttons.push({ label: 'Manage passkeys', kind: 'default', value: 'passkeys' });
             buttons.push({ label: 'Disable encryption', kind: 'danger', value: 'disable' });
 
             const choice = await modal.open({ title: 'Security', body, buttons });
@@ -1195,13 +1196,14 @@
 
         async function openManagePasskeys() {
             const support = await probePasskeySupport();
+            const available = support.supported && support.prfLikely;
             const passkeys = currentVault.security?.wraps?.passkeys || [];
 
             const body = document.createElement('div');
             const intro = document.createElement('p');
-            intro.textContent = support.supported
+            intro.textContent = available
                 ? 'Passkeys let you unlock without typing your passphrase. Your passphrase always still works, so losing a passkey is safe — but losing this device\'s passkey without also knowing your passphrase means permanent data loss.'
-                : 'This browser does not expose WebAuthn. Passkey unlock is not available here — use your passphrase.';
+                : 'Passkey unlock is not available in this browser — use your passphrase.';
             body.appendChild(intro);
 
             if (passkeys.length) {
@@ -1222,24 +1224,23 @@
                     const rm = document.createElement('button');
                     rm.className = 'modal-btn'; rm.textContent = 'Remove';
                     rm.onclick = async () => {
+                        // Close the manage dialog first — the modal system shows one dialog at a
+                        // time, so a confirm opened while this one is up would queue invisibly.
+                        modal.closeCurrent();
                         const ok = await modal.confirm({
                             title: 'Remove passkey?',
                             body: `Remove "${pk.label || 'this passkey'}"? Your passphrase (and any other registered passkeys) will still unlock the vault.`,
                             danger: true,
                             confirmLabel: 'Remove passkey'
                         });
-                        if (ok) {
-                            await removePasskey(pk.credentialId);
-                            // The current modal is already open; close and reopen so the list reflects the change.
-                            document.querySelector('#modal-root .modal-btn')?.click();
-                            openManagePasskeys();
-                        }
+                        if (ok) await removePasskey(pk.credentialId);
+                        openManagePasskeys(); // return to the (refreshed) list either way
                     };
                     li.appendChild(info); li.appendChild(rm);
                     list.appendChild(li);
                 }
                 body.appendChild(list);
-            } else if (support.supported) {
+            } else if (available) {
                 const empty = document.createElement('p');
                 empty.textContent = 'No passkeys registered yet.';
                 empty.style.marginTop = '8px';
@@ -1249,7 +1250,7 @@
             const choice = await modal.open({
                 title: 'Passkeys',
                 body,
-                buttons: support.supported
+                buttons: available
                     ? [
                         { label: 'Close', kind: 'default', value: 'close', autofocus: true },
                         { label: 'Add passkey', kind: 'primary', value: 'add' }
@@ -1355,16 +1356,11 @@
             function open(opts) {
                 if (currentClose) {
                     // Queue: wait for the current modal to close before opening the next.
-                    return new Promise((resolve) => {
-                        const prevClose = currentClose;
-                        // Wrap by chaining after the current close resolves.
-                        // We don't cancel the pending modal — that would surprise the user.
-                        Promise.resolve().then(async () => {
-                            // Poll every 50ms — simpler than plumbing a queue, and modal churn is rare.
-                            while (currentClose) await new Promise(r => setTimeout(r, 50));
-                            resolve(await open(opts));
-                        });
-                    });
+                    // Poll every 50ms — simpler than plumbing a queue, and modal churn is rare.
+                    return (async () => {
+                        while (currentClose) await new Promise(r => setTimeout(r, 50));
+                        return open(opts);
+                    })();
                 }
 
                 const {
@@ -1591,7 +1587,11 @@
                 return res.fields;
             }
 
-            return { open, confirm, alert, prompt };
+            // closeCurrent cancels the open dialog (resolving its promise with the cancel value).
+            // Used when a control inside a dialog body needs to hand off to a follow-up dialog.
+            function closeCurrent() { if (currentClose) currentClose(); }
+
+            return { open, confirm, alert, prompt, closeCurrent };
         })();
 
         function sanitizeState(s) {
@@ -1925,11 +1925,9 @@
         function saveToStorage(state) {
             const mode = currentVault.security?.mode || 'plain';
             if (mode === 'plain') {
-                try {
-                    const payload = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, state, savedAt: now() };
-                    localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
-                    currentVault.savedAt = payload.savedAt;
-                } catch(e) {}
+                const payload = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, state, savedAt: now() };
+                safeStorage.set(VAULT_KEY, JSON.stringify(payload));
+                currentVault.savedAt = payload.savedAt;
                 return;
             }
             encryptSavePending = state;
@@ -1941,10 +1939,8 @@
                         const toSave = encryptSavePending;
                         encryptSavePending = null;
                         const payload = await buildVaultPayload(toSave);
-                        try {
-                            localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
-                            currentVault.savedAt = payload.savedAt;
-                        } catch(e) {}
+                        safeStorage.set(VAULT_KEY, JSON.stringify(payload));
+                        currentVault.savedAt = payload.savedAt;
                     }
                 } finally {
                     encryptSaveInFlight = false;

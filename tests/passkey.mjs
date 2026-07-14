@@ -176,6 +176,53 @@ function serve() {
         }
     }
 
+    // --- Test B2: Remove button inside Manage Passkeys surfaces its confirm immediately ---
+    // Regression: the confirm used to queue invisibly behind the still-open manage dialog,
+    // so clicking Remove appeared to do nothing.
+    {
+        const { context, page } = await newAuthenticatedContext(true);
+        await page.goto(APP_URL);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        let ok = true;
+        try {
+            await page.evaluate(async () => {
+                window.createNote();
+                await window.enableEncryption('correct horse battery');
+                await window.registerPasskey('Removable');
+            });
+        } catch(e) { ok = false; skip('PRF registration unavailable: ' + e); }
+        if (ok) {
+            // Open the manage dialog (fire and forget — resolves only when it closes)
+            await page.evaluate(() => { window.openManagePasskeys(); });
+            await page.waitForSelector('.modal-dialog');
+            await page.evaluate(() => {
+                const btn = Array.from(document.querySelectorAll('#modal-root button'))
+                    .find(b => b.textContent === 'Remove');
+                btn.click();
+            });
+            // The confirm dialog must replace the manage dialog promptly.
+            await page.waitForFunction(
+                () => document.querySelector('.modal-title')?.textContent === 'Remove passkey?',
+                null, { timeout: 2000 }
+            );
+            assert(true, 'Remove click surfaces confirm dialog immediately');
+            // Confirm the removal and check the record is gone.
+            await page.evaluate(() => {
+                const btn = Array.from(document.querySelectorAll('#modal-root button'))
+                    .find(b => b.textContent === 'Remove passkey');
+                btn.click();
+            });
+            await page.waitForFunction(
+                () => JSON.parse(localStorage.getItem('v4_store')).security.wraps.passkeys.length === 0,
+                null, { timeout: 2000 }
+            );
+            assert(true, 'confirming removal deletes the passkey record');
+        }
+        await context.close();
+    }
+
     // --- Test C: Virtual authenticator without PRF surfaces a clear error ---
     {
         const { context, page } = await newAuthenticatedContext(false);
