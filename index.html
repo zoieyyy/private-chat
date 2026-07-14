@@ -261,25 +261,74 @@
             }
         }
 
-        // --- Initialization & Boot ---
-        function loadBootState() {
-            // Both sources are consulted and the freshest one wins (savedAt is stamped on
-            // every persist). Previously the embedded JSON always won, which meant edits
-            // made inside an exported file were silently thrown away on reload.
+        // --- Vault Layer ---
+        // The on-disk shape is a "vault": { vaultVersion, security: { mode }, state|ciphertext, savedAt }.
+        // security.mode = 'plain' stores state as-is; 'encrypted' stores AES-GCM ciphertext plus
+        // the metadata needed to re-derive the wrapping key(s). Splitting metadata from state lets
+        // encryption be added without touching reducers, and lets the boot flow decide whether to
+        // hand the app a decrypted state or a lock screen.
+        const VAULT_KEY = 'v4_store';
+        const VAULT_VERSION = 1;
+
+        function freshState() {
+            return { folders: [{ id: generateId(), name: "General", isExpanded: true }], notes: [], activeNoteId: null, searchQuery: '' };
+        }
+        function freshVaultMeta() {
+            return { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: 0 };
+        }
+
+        // Module-level vault metadata (security config + savedAt). Keeping this outside the
+        // Redux store means crypto material never flows through actions or the BroadcastChannel.
+        let currentVault = freshVaultMeta();
+
+        function readRawVault() {
             let embedded = null, local = null;
             try {
                 const e = JSON.parse(document.getElementById('app-data').textContent);
-                if (e && e.folders) embedded = e;
+                if (e && (e.folders || e.vaultVersion)) embedded = e;
             } catch(err) {}
             try {
-                const l = JSON.parse(localStorage.getItem('v4_store'));
-                if (l && l.folders) local = l;
+                const l = JSON.parse(localStorage.getItem(VAULT_KEY));
+                if (l && (l.folders || l.vaultVersion)) local = l;
             } catch(err) {}
-
             if (embedded && local) return (embedded.savedAt || 0) > (local.savedAt || 0) ? embedded : local;
-            if (embedded || local) return embedded || local;
+            return embedded || local || null;
+        }
 
-            return { folders: [{ id: generateId(), name: "General", isExpanded: true }], notes: [], activeNoteId: null, searchQuery: '' };
+        // Returns { state, vault, locked }. state is null when the vault is encrypted and
+        // requires unlock. vault carries only non-secret metadata for the app to prompt against.
+        function loadBootVault() {
+            const raw = readRawVault();
+            if (!raw) return { state: freshState(), vault: freshVaultMeta(), locked: false };
+
+            // Backward-compat: pre-vault shape had folders at the top level.
+            if (raw.folders && !raw.vaultVersion) {
+                return {
+                    state: {
+                        folders: raw.folders,
+                        notes: Array.isArray(raw.notes) ? raw.notes : [],
+                        activeNoteId: raw.activeNoteId ?? null,
+                        searchQuery: typeof raw.searchQuery === 'string' ? raw.searchQuery : ''
+                    },
+                    vault: { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: raw.savedAt || 0 },
+                    locked: false
+                };
+            }
+
+            if (raw.vaultVersion === VAULT_VERSION && raw.security?.mode === 'plain') {
+                const s = raw.state && raw.state.folders ? raw.state : freshState();
+                return {
+                    state: s,
+                    vault: { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: raw.savedAt || 0 },
+                    locked: false
+                };
+            }
+
+            if (raw.vaultVersion === VAULT_VERSION && raw.security?.mode === 'encrypted') {
+                return { state: null, vault: raw, locked: true };
+            }
+
+            return { state: freshState(), vault: freshVaultMeta(), locked: false };
         }
 
         let store;
@@ -290,24 +339,38 @@
         let toastTimeout;
         const TRASH_TTL_MS = 7 * 24 * 60 * 60 * 1000; // purge soft-deleted notes after 7 days
 
-        function init() {
-            let initialState = loadBootState();
+        // In-memory Data Encryption Key. Populated on unlock, wiped on lock. Never persisted,
+        // never broadcast. Declared here so plain-mode code paths can reference it defensively.
+        let currentDek = null;
 
-            // Guarantee at least one folder exists
-            if (!Array.isArray(initialState.folders) || initialState.folders.length === 0) {
-                initialState.folders = [{ id: generateId(), name: "General", isExpanded: true }];
+        // Crypto helpers are attached in the encryption commit. Stubbed here so plain-mode
+        // callers (which never hit encrypt/decrypt) work with zero dependencies on Web Crypto.
+        const cryptoUtils = {
+            async encrypt() { throw new Error('cryptoUtils not initialized'); },
+            async decrypt() { throw new Error('cryptoUtils not initialized'); }
+        };
+
+        function sanitizeState(s) {
+            if (!Array.isArray(s.folders) || s.folders.length === 0) {
+                s.folders = [{ id: generateId(), name: "General", isExpanded: true }];
             }
-            if (!Array.isArray(initialState.notes)) initialState.notes = [];
-            if (typeof initialState.searchQuery !== 'string') initialState.searchQuery = '';
-
-            // Purge expired trash, sweep orphans, backfill timestamps
-            initialState.notes = initialState.notes.filter(n => !n.deletedAt || (now() - n.deletedAt) < TRASH_TTL_MS);
-            initialState.notes.forEach(n => {
+            if (!Array.isArray(s.notes)) s.notes = [];
+            if (typeof s.searchQuery !== 'string') s.searchQuery = '';
+            s.notes = s.notes.filter(n => !n.deletedAt || (now() - n.deletedAt) < TRASH_TTL_MS);
+            s.notes.forEach(n => {
                 if (!n.updatedAt) n.updatedAt = now();
-                if (!initialState.folders.some(f => f.id === n.folderId)) n.folderId = initialState.folders[0]?.id;
+                if (!s.folders.some(f => f.id === n.folderId)) n.folderId = s.folders[0]?.id;
             });
+            return s;
+        }
 
-            store = createStore(initialState);
+        function init() {
+            const boot = loadBootVault();
+            currentVault = boot.vault;
+
+            // Encrypted vaults will get their real state once the user unlocks. Boot the store
+            // with an empty shell so subscribers and renderers don't have to special-case null.
+            let initialState = boot.state ? sanitizeState(boot.state) : freshState();
 
             // Subscriptions
             store.subscribe((state, action) => {
@@ -549,16 +612,66 @@
         }
 
         // --- Utilities ---
-        function saveToStorage(state) {
-            // Because localStorage is synchronous, saving on every stroke is safe from data-loss.
-            // Performance is maintained because we only patch the DOM instead of re-rendering.
-            // savedAt lets loadBootState pick the freshest of embedded JSON vs localStorage.
-            try {
-                localStorage.setItem('v4_store', JSON.stringify({ ...state, savedAt: now() }));
-            } catch(e) {
-                // Quota exceeded or storage unavailable (private mode) — the in-memory
-                // state and the "Download App" export still work.
+        // Serialize the current state into a vault payload for localStorage / export. In plain mode
+        // this is trivially the state; in encrypted mode this becomes AES-GCM ciphertext plus the
+        // wrap metadata needed to unlock it on a fresh device. This function is the single point
+        // where in-memory state becomes on-disk bytes, which makes it the correct place to enforce
+        // "encrypted vaults must be unlocked to save."
+        async function buildVaultPayload(state) {
+            const savedAt = now();
+            const mode = currentVault.security?.mode || 'plain';
+            if (mode === 'plain') {
+                return { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, state, savedAt };
             }
+            if (mode === 'encrypted') {
+                if (!currentDek) throw new Error('Encrypted vault is locked; cannot save');
+                const plaintext = JSON.stringify(state);
+                const { iv, data } = await cryptoUtils.encrypt(currentDek, plaintext);
+                return {
+                    vaultVersion: VAULT_VERSION,
+                    security: currentVault.security,
+                    ciphertext: { alg: 'AES-256-GCM', iv, data },
+                    savedAt
+                };
+            }
+            throw new Error('Unknown vault mode: ' + mode);
+        }
+
+        // saveToStorage is called synchronously from every dispatch (including keystrokes).
+        // Plain mode writes inline. Encrypted mode chains async encryption behind a
+        // latest-wins queue: rapid keystrokes coalesce into at most one in-flight save
+        // plus one pending save, so we never queue up an unbounded backlog of encryptions
+        // and the most recent state always ends up on disk.
+        let encryptSavePending = null;
+        let encryptSaveInFlight = false;
+        function saveToStorage(state) {
+            const mode = currentVault.security?.mode || 'plain';
+            if (mode === 'plain') {
+                try {
+                    const payload = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, state, savedAt: now() };
+                    localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
+                    currentVault.savedAt = payload.savedAt;
+                } catch(e) {}
+                return;
+            }
+            encryptSavePending = state;
+            if (encryptSaveInFlight) return;
+            encryptSaveInFlight = true;
+            (async () => {
+                try {
+                    while (encryptSavePending) {
+                        const toSave = encryptSavePending;
+                        encryptSavePending = null;
+                        const payload = await buildVaultPayload(toSave);
+                        try {
+                            localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
+                            currentVault.savedAt = payload.savedAt;
+                        } catch(e) {}
+                    }
+                } finally {
+                    encryptSaveInFlight = false;
+                }
+            })();
         }
 
         function showToast() {
@@ -607,15 +720,25 @@
         }
 
         // The "File-Over-App" Export Engine
-        function exportSelfContainedHtml() {
+        // Exports carry the same vault payload as localStorage — plain or encrypted, including
+        // all wrap metadata — so an exported HTML opened cold on a new device is exactly as
+        // protected as (and identically restorable as) the browser copy it came from.
+        async function exportSelfContainedHtml() {
             const html = document.documentElement.cloneNode(true);
             const dataScript = html.querySelector('#app-data');
 
-            // Inject current memory state into the DOM clone. Escaping "<" as \u003c
-            // keeps a literal closing script tag inside note content from terminating
-            // the data script tag and corrupting the exported file (JSON.parse still
-            // decodes \u003c transparently).
-            dataScript.textContent = JSON.stringify({ ...store.getState(), savedAt: now() }).replace(/</g, '\\u003c');
+            let payload;
+            try {
+                payload = await buildVaultPayload(store.getState());
+            } catch(err) {
+                alert('Cannot export while the vault is locked. Unlock first.');
+                return;
+            }
+
+            // Escaping "<" as \u003c keeps a literal closing script tag inside note content
+            // from terminating the data script tag and corrupting the exported file
+            // (JSON.parse still decodes \u003c transparently).
+            dataScript.textContent = JSON.stringify(payload).replace(/</g, '\\u003c');
 
             // Strip transient UI so the export is clean; init() re-renders on boot.
             html.querySelector('#tree-container').innerHTML = '';
@@ -625,7 +748,9 @@
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `notes_v4_${new Date().toISOString().split('T')[0]}.html`;
+            // Include time so exporting twice in one day doesn't silently overwrite.
+            const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            a.download = `notes_v4_${ts}.html`;
             a.click();
             URL.revokeObjectURL(url);
         }
