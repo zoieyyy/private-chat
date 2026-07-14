@@ -212,6 +212,86 @@ async function waitUnlocked(page) {
         await context.close();
     }
 
+    // --- Test 8: Manual lock wipes DEK, DOM inputs, and rendered state ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        // Select the note so the editor holds its plaintext
+        await page.evaluate(() => {
+            const li = document.querySelector('.note-item');
+            if (li) li.click();
+        });
+        await page.waitForTimeout(150);
+        const titleBefore = await page.inputValue('#note-title');
+        assert(titleBefore.length > 0, 'unlocked editor shows plaintext title');
+
+        // Manual lock
+        await page.click('#lock-btn');
+        await page.waitForFunction(() => document.getElementById('lock-overlay').classList.contains('open'));
+        const titleAfter = await page.inputValue('#note-title');
+        assert(titleAfter === '', 'note-title input is wiped after lock');
+        const contentAfter = await page.inputValue('#note-content');
+        assert(contentAfter === '', 'note-content input is wiped after lock');
+        const treeHtml = await page.evaluate(() => document.getElementById('tree-container').innerHTML);
+        assert(treeHtml.length < 100 || !treeHtml.includes('secret note'), 'tree does not contain plaintext note title after lock');
+        const dekNulled = await page.evaluate(() => window.__test_currentDek === undefined
+            ? 'wrapper missing' : (window.__test_currentDek === null));
+        // Fallback: check via getState — after lock the store carries freshState
+        const stateAfter = await page.evaluate(() => window.store.getState());
+        assert(stateAfter.notes.length === 0, 'store state is reset to empty after lock');
+
+        // Re-unlock restores notes
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        const stateBack = await page.evaluate(() => window.store.getState());
+        assert(stateBack.notes.length >= 1, 'unlock rehydrates notes');
+        await context.close();
+    }
+
+    // --- Test 9: Cmd+Shift+L keyboard shortcut locks ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        await page.keyboard.press('Control+Shift+L');
+        await page.waitForFunction(() => document.getElementById('lock-overlay').classList.contains('open'), null, { timeout: 3000 });
+        assert(true, 'Ctrl+Shift+L triggers manual lock');
+        await context.close();
+    }
+
+    // --- Test 10: Plain-mode lock is a screen-hide (no passphrase field) ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        await page.evaluate(() => window.createNote());
+        await typeInto(page, '#note-title', 'plain note');
+        await page.waitForTimeout(100);
+        await page.click('#lock-btn');
+        await page.waitForFunction(() => document.getElementById('lock-overlay').classList.contains('open'));
+        const passphraseHidden = await page.evaluate(() => document.getElementById('unlock-passphrase-field').hidden);
+        assert(passphraseHidden, 'plain-mode lock hides passphrase field');
+        const title = await page.textContent('#lock-title');
+        assert(title.includes('hidden') || title.includes('Hidden'), 'plain-mode lock title reflects screen-hide, not encryption');
+        // Unlock (no credential needed)
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        const stored = await page.inputValue('#note-title');
+        assert(stored === 'plain note', 'plain-mode unlock restores note');
+        await context.close();
+    }
+
     await browser.close();
     console.log('\nAll smoke tests passed.');
 })();

@@ -225,6 +225,7 @@
                 <button onclick="exportSelfContainedHtml()">Download App</button>
                 <button id="theme-toggle" onclick="toggleTheme()">Dark Mode</button>
                 <button id="security-btn" onclick="openSecurityPanel()">Security</button>
+                <button id="lock-btn" onclick="lockApp('manual')" title="Lock (Cmd+Shift+L)">Lock</button>
             </div>
         </div>
         <div id="tree-container"></div>
@@ -268,7 +269,7 @@
             <h1 id="lock-title">Vault Locked</h1>
             <p id="lock-subtitle">Enter your passphrase to unlock your notes.</p>
             <form class="lock-form" id="unlock-form">
-                <div>
+                <div id="unlock-passphrase-field">
                     <label for="unlock-passphrase">Passphrase</label>
                     <input type="password" id="unlock-passphrase" autocomplete="current-password" autofocus>
                 </div>
@@ -586,6 +587,7 @@
             // atomically (rather than waiting for the next dispatch).
             saveToStorage(store.getState());
             renderTree(store.getState());
+            resetIdleTimer();
         }
 
         async function disableEncryption(passphrase) {
@@ -601,6 +603,7 @@
             currentDek = null;
             saveToStorage(store.getState());
             renderTree(store.getState());
+            resetIdleTimer();
         }
 
         async function changePassphrase(oldPassphrase, newPassphrase) {
@@ -698,11 +701,23 @@
             form.onsubmit = async (e) => {
                 e.preventDefault();
                 errEl.textContent = '';
+                if (currentVault.security.mode === 'plain') {
+                    // Plain-mode "lock" is just a screen-hide; no credential to verify.
+                    // Rehydrate state from the freshest on-disk copy and drop the overlay.
+                    const boot = loadBootVault();
+                    if (boot.state) store.dispatchFromSync({ type: '__HYDRATE__', state: sanitizeState(boot.state) });
+                    hideLockOverlay();
+                    isLocked = false;
+                    resetIdleTimer();
+                    return;
+                }
                 const passphrase = document.getElementById('unlock-passphrase').value;
                 if (!passphrase) { errEl.textContent = 'Passphrase required.'; return; }
                 btn.disabled = true; btn.textContent = 'Unlocking…';
                 try {
                     await unlockWithPassphrase(passphrase);
+                    isLocked = false;
+                    resetIdleTimer();
                 } catch(err) {
                     // Don't distinguish "wrong passphrase" from "corrupt blob" in the message —
                     // both are recoverable from the user's perspective only by trying again or
@@ -713,6 +728,134 @@
                     btn.disabled = false; btn.textContent = 'Unlock';
                 }
             };
+        }
+
+        // --- App Lock ---
+        // Manual and idle lock. Locking must actually wipe decrypted state — clearing DEK from
+        // memory, resetting the store to an empty shell, and blanking the DOM inputs that hold
+        // decrypted title/content — not just overlay a lock screen on top of a live DOM.
+        // Idle lock is only armed for encrypted vaults; auto-locking a plain vault would only
+        // hide notes the operating-system user can already read from localStorage anyway.
+        let isLocked = false;
+        let idleTimerId = null;
+        let lastActivityAt = Date.now();
+        const AUTO_LOCK_KEY = 'v4_autolock_ms';
+        const AUTO_LOCK_DEFAULT_MS = 5 * 60 * 1000;
+        const AUTO_LOCK_OPTIONS = [
+            { label: 'Never', value: 0 },
+            { label: '1 minute', value: 60 * 1000 },
+            { label: '5 minutes', value: 5 * 60 * 1000 },
+            { label: '15 minutes', value: 15 * 60 * 1000 },
+            { label: '30 minutes', value: 30 * 60 * 1000 },
+            { label: '1 hour', value: 60 * 60 * 1000 }
+        ];
+
+        function getAutoLockMs() {
+            const v = parseInt(localStorage.getItem(AUTO_LOCK_KEY), 10);
+            if (Number.isFinite(v) && v >= 0) return v;
+            return AUTO_LOCK_DEFAULT_MS;
+        }
+        function setAutoLockMs(ms) {
+            localStorage.setItem(AUTO_LOCK_KEY, String(ms));
+            resetIdleTimer();
+        }
+
+        function resetIdleTimer() {
+            lastActivityAt = Date.now();
+            if (idleTimerId != null) { clearInterval(idleTimerId); idleTimerId = null; }
+            const timeout = getAutoLockMs();
+            // Idle lock is meaningful only when unlock actually costs something. In plain mode
+            // it's cosmetic and interrupts writing for no gain, so we skip arming it.
+            if (timeout <= 0 || isLocked) return;
+            if (currentVault.security?.mode !== 'encrypted') return;
+            // Check at a fraction of the interval so we don't fire more than one tick late.
+            const tick = Math.max(5000, Math.min(30000, Math.floor(timeout / 6)));
+            idleTimerId = setInterval(() => {
+                if (isLocked) return;
+                if (Date.now() - lastActivityAt >= timeout) {
+                    lockApp('idle');
+                }
+            }, tick);
+        }
+
+        function noteActivity() {
+            if (isLocked) return;
+            lastActivityAt = Date.now();
+        }
+
+        function installActivityListeners() {
+            // Throttle mousemove so we don't churn Date.now() on every pixel. Keydown / click /
+            // touch are the strong signals — mousemove alone can be triggered by external
+            // hardware (screen switcher, cursor jiggler) so we don't rely on it exclusively.
+            let lastMove = 0;
+            document.addEventListener('mousemove', () => {
+                const t = Date.now();
+                if (t - lastMove > 5000) { lastMove = t; noteActivity(); }
+            }, { passive: true });
+            for (const ev of ['keydown', 'click', 'touchstart', 'focus']) {
+                document.addEventListener(ev, noteActivity, { passive: true, capture: true });
+            }
+            // Locking a tab that's been backgrounded for the auto-lock timeout on wake is the
+            // whole point of idle lock; visibilitychange gives us a check-in on wake too.
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') {
+                    const timeout = getAutoLockMs();
+                    if (timeout > 0 && currentVault.security?.mode === 'encrypted' && !isLocked
+                        && Date.now() - lastActivityAt >= timeout) {
+                        lockApp('idle');
+                    }
+                }
+            });
+        }
+
+        function wipeDomForLock() {
+            // Clear input .value fields that hold decrypted plaintext — patchEditorState
+            // doesn't touch them when there's no active note, so they'd otherwise linger
+            // in the DOM inspectable to anyone with the running tab.
+            const t = document.getElementById('note-title'); if (t) t.value = '';
+            const c = document.getElementById('note-content'); if (c) c.value = '';
+            const s = document.getElementById('search-input'); if (s) s.value = '';
+            const tree = document.getElementById('tree-container'); if (tree) tree.innerHTML = '';
+            const preview = document.getElementById('preview-layer'); if (preview) preview.innerHTML = '';
+            const toast = document.getElementById('toast'); if (toast) toast.classList.remove('visible');
+        }
+
+        async function lockApp(reason) {
+            if (isLocked) return;
+            // Flush any pending encrypted save so the last edits land on disk BEFORE we drop the DEK.
+            // Losing a keystroke to a lock is worse than the extra ~ms it takes to encrypt one more time.
+            if (currentVault.security?.mode === 'encrypted' && currentDek) {
+                try {
+                    const payload = await buildVaultPayload(store.getState());
+                    localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
+                    currentVault.savedAt = payload.savedAt;
+                } catch(err) {
+                    console.warn('Failed to flush before lock:', err);
+                }
+            }
+            // Cancel any pending save; the state will be empty after hydrate and we don't want
+            // an empty-state ciphertext to overwrite the real one.
+            encryptSavePending = null;
+            currentDek = null;
+            isLocked = true;
+            if (idleTimerId != null) { clearInterval(idleTimerId); idleTimerId = null; }
+
+            store.dispatchFromSync({ type: '__HYDRATE__', state: freshState() });
+            wipeDomForLock();
+
+            if (currentVault.security?.mode === 'encrypted') {
+                document.getElementById('lock-title').textContent = 'Vault Locked';
+                document.getElementById('unlock-passphrase-field').hidden = false;
+                showLockOverlay(reason === 'idle'
+                    ? 'Auto-locked after inactivity. Enter your passphrase to continue.'
+                    : 'Enter your passphrase to unlock your notes.');
+            } else {
+                // Plain-mode "lock" is a screen-hide, not encryption. Be explicit about that
+                // in the overlay copy so users don't develop false confidence.
+                document.getElementById('lock-title').textContent = 'Notes hidden';
+                document.getElementById('unlock-passphrase-field').hidden = true;
+                showLockOverlay('This vault is not encrypted — anyone with access to this browser can still read your notes from storage. Click Unlock to bring them back.');
+            }
         }
 
         // --- Security Panel ---
@@ -755,9 +898,39 @@
         }
 
         async function openEncryptedSecurityMenu() {
+            // Build a rich body with the auto-lock timeout selector inline. Doing it as HTML
+            // lets the user change the timeout without an extra modal hop, which matters because
+            // this is where they'll actually go looking for it.
+            const body = document.createElement('div');
+            const p = document.createElement('p');
+            p.innerHTML = 'Encryption is on. Your notes are stored as AES-256-GCM ciphertext in this browser and in any downloaded exports.';
+            body.appendChild(p);
+
+            const timeoutWrap = document.createElement('div');
+            timeoutWrap.style.marginTop = '12px';
+            const timeoutLabel = document.createElement('label');
+            timeoutLabel.textContent = 'Auto-lock after inactivity: ';
+            timeoutLabel.style.color = 'var(--text-main)';
+            timeoutLabel.style.fontSize = '13px';
+            const select = document.createElement('select');
+            select.className = 'folder-select';
+            select.style.marginLeft = '8px';
+            const current = getAutoLockMs();
+            for (const opt of AUTO_LOCK_OPTIONS) {
+                const o = document.createElement('option');
+                o.value = String(opt.value); o.textContent = opt.label;
+                if (opt.value === current) o.selected = true;
+                select.appendChild(o);
+            }
+            select.onchange = () => setAutoLockMs(parseInt(select.value, 10) || 0);
+            timeoutLabel.htmlFor = select.id = 'autolock-select';
+            timeoutWrap.appendChild(timeoutLabel);
+            timeoutWrap.appendChild(select);
+            body.appendChild(timeoutWrap);
+
             const choice = await modal.open({
                 title: 'Security',
-                body: 'Encryption is on. Your notes are stored as AES-256-GCM ciphertext in this browser and in any downloaded exports.',
+                body,
                 buttons: [
                     { label: 'Close', kind: 'default', value: 'close', autofocus: true },
                     { label: 'Change passphrase', kind: 'primary', value: 'change' },
@@ -1110,7 +1283,9 @@
             let initialState = boot.state ? sanitizeState(boot.state) : freshState();
 
             bindUnlockForm();
+            installActivityListeners();
             if (boot.locked) {
+                isLocked = true;
                 showLockOverlay('Enter your passphrase to unlock your notes.');
             }
 
@@ -1131,13 +1306,21 @@
                 patchEditorState(state);
             });
 
-            syncChannel.onmessage = (e) => store.dispatchFromSync(e.data);
+            syncChannel.onmessage = (e) => {
+                // Ignore actions from other tabs while we're locked — our state is intentionally
+                // wiped, and applying edits to freshState would corrupt what unlock rehydrates.
+                if (isLocked) return;
+                store.dispatchFromSync(e.data);
+            };
 
             // Initial render
             const state = store.getState();
             if (localStorage.getItem('v4_theme') === 'dark') toggleTheme(true);
             renderTree(state);
             patchEditorState(state);
+
+            // Arm the idle timer only once the vault mode is known and (in encrypted mode) unlocked.
+            if (!boot.locked) resetIdleTimer();
         }
 
         // --- Actions & Dispatchers ---
@@ -1520,6 +1703,16 @@
 
         // Global Keyboard Shortcuts
         document.addEventListener('keydown', (e) => {
+            // Manual lock. Encrypted mode is where this matters; in plain mode it's still
+            // available (as a screen-hide), which is at worst harmless.
+            if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+                e.preventDefault();
+                lockApp('manual');
+                return;
+            }
+            // Global shortcuts should not fire while the app is locked — the sidebar and editor
+            // are inert but keydown still bubbles up here.
+            if (isLocked) return;
             if ((e.metaKey || e.ctrlKey) && e.key === 'n') { e.preventDefault(); createNote(); document.getElementById('note-title').focus(); }
             if ((e.metaKey || e.ctrlKey) && e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
             if (e.key === 'Escape') {
