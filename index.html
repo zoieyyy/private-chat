@@ -179,6 +179,34 @@
         .modal-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
         .modal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+        /* Lock Overlay */
+        #lock-overlay {
+            position: fixed; inset: 0; z-index: 300;
+            background: var(--bg-app); color: var(--text-main);
+            display: none; align-items: center; justify-content: center;
+            padding: 24px;
+        }
+        #lock-overlay.open { display: flex; }
+        .lock-card {
+            background: var(--bg-card); border: 1px solid var(--border-color);
+            border-radius: 12px; padding: 32px; max-width: 440px; width: 100%;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        }
+        .lock-card h1 { font-size: 22px; margin-bottom: 8px; }
+        .lock-card p { font-size: 14px; color: var(--text-muted); margin-bottom: 20px; line-height: 1.5; }
+        .lock-form { display: flex; flex-direction: column; gap: 12px; }
+        .lock-form label { font-size: 13px; font-weight: 500; }
+        .lock-form input {
+            width: 100%; padding: 10px 12px; border: 1px solid var(--border-color); border-radius: 6px;
+            background: var(--bg-app); color: var(--text-main); font-size: 14px; outline: none; font-family: inherit;
+        }
+        .lock-form input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent); }
+        .lock-error { font-size: 13px; color: var(--danger); min-height: 18px; }
+        .lock-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        .lock-actions button { flex: 1; min-width: 120px; }
+        .lock-meta { font-size: 12px; color: var(--text-muted); margin-top: 12px; }
+        body.locked #sidebar, body.locked #editor-wrapper { visibility: hidden; }
+
     </style>
 </head>
 <body>
@@ -193,9 +221,10 @@
                 </div>
             </div>
             <input type="text" id="search-input" class="search-box" placeholder="Search (Cmd+/)..." oninput="handleSearch()">
-            <div class="action-group" style="margin-top: 8px; display: flex; gap: 4px;">
+            <div class="action-group" style="margin-top: 8px; display: flex; gap: 4px; flex-wrap: wrap;">
                 <button onclick="exportSelfContainedHtml()">Download App</button>
                 <button id="theme-toggle" onclick="toggleTheme()">Dark Mode</button>
+                <button id="security-btn" onclick="openSecurityPanel()">Security</button>
             </div>
         </div>
         <div id="tree-container"></div>
@@ -233,6 +262,25 @@
     </div>
 
     <div id="modal-root" aria-hidden="true"></div>
+
+    <div id="lock-overlay" role="dialog" aria-modal="true" aria-labelledby="lock-title">
+        <div class="lock-card">
+            <h1 id="lock-title">Vault Locked</h1>
+            <p id="lock-subtitle">Enter your passphrase to unlock your notes.</p>
+            <form class="lock-form" id="unlock-form">
+                <div>
+                    <label for="unlock-passphrase">Passphrase</label>
+                    <input type="password" id="unlock-passphrase" autocomplete="current-password" autofocus>
+                </div>
+                <div class="lock-error" id="unlock-error" role="alert" aria-live="polite"></div>
+                <div class="lock-actions">
+                    <button type="submit" class="modal-btn primary" id="unlock-submit">Unlock</button>
+                    <button type="button" class="modal-btn" id="unlock-passkey-btn" hidden>Unlock with passkey</button>
+                </div>
+                <div class="lock-meta" id="lock-meta"></div>
+            </form>
+        </div>
+    </div>
 
     <script id="app-data" type="application/json">null</script>
 
@@ -308,6 +356,11 @@
                     return { ...state, folders: state.folders.filter(f => f.id !== action.id), notes: state.notes.map(n => n.folderId === action.id ? { ...n, deletedAt: action.at } : n), activeNoteId: null };
                 case 'UI_SEARCH':
                     return { ...state, searchQuery: action.query };
+                case '__HYDRATE__':
+                    // Wholesale state replacement used only by unlock and app-lock flows.
+                    // Never broadcast (it carries decrypted plaintext); dispatch via
+                    // dispatchFromSync so the sync channel is bypassed.
+                    return action.state;
                 default:
                     return state;
             }
@@ -395,12 +448,378 @@
         // never broadcast. Declared here so plain-mode code paths can reference it defensively.
         let currentDek = null;
 
-        // Crypto helpers are attached in the encryption commit. Stubbed here so plain-mode
-        // callers (which never hit encrypt/decrypt) work with zero dependencies on Web Crypto.
+        // --- Crypto Utilities ---
+        // Envelope encryption primitives. AES-256-GCM for note content (authenticated encryption
+        // means wrong keys/tampered ciphertext fail decrypt cleanly, so we can distinguish wrong
+        // passphrase from corrupted blob without leaking which is which to the user). PBKDF2 with
+        // 600k iterations for passphrase→KEK (current OWASP floor for SHA-256; revisit as
+        // hardware improves — the iteration count is stored in the vault so we can raise it
+        // without breaking older exports). AES-KW to wrap the DEK under each KEK; this keeps the
+        // note ciphertext independent of the credential used to unlock, so adding a second
+        // credential doesn't require re-encrypting all notes.
+        const PBKDF2_ITERATIONS_DEFAULT = 600_000;
+        const PBKDF2_ITERATIONS_MIN = 600_000; // Refuse to derive with fewer than this many rounds even if a vault claims otherwise.
+        const HKDF_INFO_PASSKEY = 'notes-passkey-kek-v1';
+
         const cryptoUtils = {
-            async encrypt() { throw new Error('cryptoUtils not initialized'); },
-            async decrypt() { throw new Error('cryptoUtils not initialized'); }
+            b64: {
+                encode(buf) {
+                    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+                    // Chunked to avoid "Maximum call stack size exceeded" on large ciphertexts.
+                    let s = '';
+                    const CHUNK = 0x8000;
+                    for (let i = 0; i < bytes.length; i += CHUNK) {
+                        s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+                    }
+                    return btoa(s);
+                },
+                decode(str) {
+                    const bin = atob(str);
+                    const out = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+                    return out;
+                }
+            },
+            b64url: {
+                encode(buf) {
+                    return cryptoUtils.b64.encode(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                },
+                decode(str) {
+                    const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+                    return cryptoUtils.b64.decode(str.replace(/-/g, '+').replace(/_/g, '/') + pad);
+                }
+            },
+            randomBytes(n) { return crypto.getRandomValues(new Uint8Array(n)); },
+
+            async encrypt(dek, plaintext) {
+                const iv = this.randomBytes(12);
+                const encoded = new TextEncoder().encode(plaintext);
+                const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, dek, encoded);
+                return { iv: this.b64.encode(iv), data: this.b64.encode(new Uint8Array(ct)) };
+            },
+            async decrypt(dek, ivB64, dataB64) {
+                const iv = this.b64.decode(ivB64);
+                const data = this.b64.decode(dataB64);
+                const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, dek, data);
+                return new TextDecoder().decode(pt);
+            },
+
+            async generateDek() {
+                // extractable=true so we can rewrap it when the user adds a passkey, changes the
+                // passphrase, or exports a vault re-keyed for a different credential.
+                return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+            },
+
+            async deriveKekFromPassphrase(passphrase, saltU8, iterations) {
+                if (iterations < PBKDF2_ITERATIONS_MIN) {
+                    throw new Error('PBKDF2 iteration count below policy minimum');
+                }
+                const material = await crypto.subtle.importKey(
+                    'raw', new TextEncoder().encode(passphrase),
+                    { name: 'PBKDF2' }, false, ['deriveKey']
+                );
+                return crypto.subtle.deriveKey(
+                    { name: 'PBKDF2', salt: saltU8, iterations, hash: 'SHA-256' },
+                    material,
+                    { name: 'AES-KW', length: 256 },
+                    false,
+                    ['wrapKey', 'unwrapKey']
+                );
+            },
+
+            async deriveKekFromPrf(prfOutput, saltU8) {
+                const material = await crypto.subtle.importKey(
+                    'raw', prfOutput, { name: 'HKDF' }, false, ['deriveKey']
+                );
+                return crypto.subtle.deriveKey(
+                    { name: 'HKDF', hash: 'SHA-256', salt: saltU8, info: new TextEncoder().encode(HKDF_INFO_PASSKEY) },
+                    material,
+                    { name: 'AES-KW', length: 256 },
+                    false,
+                    ['wrapKey', 'unwrapKey']
+                );
+            },
+
+            async wrapDek(dek, kek) {
+                const wrapped = await crypto.subtle.wrapKey('raw', dek, kek, 'AES-KW');
+                return this.b64.encode(new Uint8Array(wrapped));
+            },
+            async unwrapDek(wrappedB64, kek) {
+                const wrapped = this.b64.decode(wrappedB64);
+                return crypto.subtle.unwrapKey(
+                    'raw', wrapped, kek, 'AES-KW',
+                    { name: 'AES-GCM', length: 256 },
+                    true, ['encrypt', 'decrypt']
+                );
+            }
         };
+
+        // --- Vault Encryption Operations ---
+        // All the state transitions between plain and encrypted vaults live here so they can be
+        // reasoned about as a unit. Each function is atomic: either the vault ends up in the
+        // requested target state with a valid persisted payload, or it stays in the source state
+        // with an error surfaced to the caller — we never leave localStorage half-migrated.
+
+        async function enableEncryption(passphrase) {
+            if (currentVault.security.mode !== 'plain') throw new Error('Vault is already encrypted');
+            const salt = cryptoUtils.randomBytes(16);
+            const iterations = PBKDF2_ITERATIONS_DEFAULT;
+            const kek = await cryptoUtils.deriveKekFromPassphrase(passphrase, salt, iterations);
+            const dek = await cryptoUtils.generateDek();
+            const wrappedPassphrase = await cryptoUtils.wrapDek(dek, kek);
+
+            currentDek = dek;
+            currentVault = {
+                vaultVersion: VAULT_VERSION,
+                security: {
+                    mode: 'encrypted',
+                    kdf: { name: 'PBKDF2-SHA256', iterations, salt: cryptoUtils.b64.encode(salt) },
+                    dekAlg: 'AES-256-GCM',
+                    wraps: {
+                        passphrase: { alg: 'AES-KW', wrapped: wrappedPassphrase },
+                        passkeys: []
+                    }
+                },
+                savedAt: now()
+            };
+            // Force an immediate encrypted save so the on-disk vault reflects the new mode
+            // atomically (rather than waiting for the next dispatch).
+            saveToStorage(store.getState());
+            renderTree(store.getState());
+        }
+
+        async function disableEncryption(passphrase) {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const meta = currentVault.security;
+            const salt = cryptoUtils.b64.decode(meta.kdf.salt);
+            const kek = await cryptoUtils.deriveKekFromPassphrase(passphrase, salt, meta.kdf.iterations);
+            // Verify by unwrapping; wrong passphrase throws.
+            const dek = await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, kek);
+            // Keep the (still-decrypted) current state in memory; just flip modes and re-save.
+            currentDek = dek;
+            currentVault = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: now() };
+            currentDek = null;
+            saveToStorage(store.getState());
+            renderTree(store.getState());
+        }
+
+        async function changePassphrase(oldPassphrase, newPassphrase) {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const meta = currentVault.security;
+            const oldSalt = cryptoUtils.b64.decode(meta.kdf.salt);
+            const oldKek = await cryptoUtils.deriveKekFromPassphrase(oldPassphrase, oldSalt, meta.kdf.iterations);
+            const dek = await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, oldKek);
+
+            const newSalt = cryptoUtils.randomBytes(16);
+            const iterations = PBKDF2_ITERATIONS_DEFAULT;
+            const newKek = await cryptoUtils.deriveKekFromPassphrase(newPassphrase, newSalt, iterations);
+            const newWrapped = await cryptoUtils.wrapDek(dek, newKek);
+
+            currentDek = dek;
+            currentVault = {
+                ...currentVault,
+                security: {
+                    ...meta,
+                    kdf: { name: 'PBKDF2-SHA256', iterations, salt: cryptoUtils.b64.encode(newSalt) },
+                    wraps: { ...meta.wraps, passphrase: { alg: 'AES-KW', wrapped: newWrapped } }
+                },
+                savedAt: now()
+            };
+            saveToStorage(store.getState());
+        }
+
+        async function unlockWithPassphrase(passphrase) {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const meta = currentVault.security;
+            const salt = cryptoUtils.b64.decode(meta.kdf.salt);
+            const kek = await cryptoUtils.deriveKekFromPassphrase(passphrase, salt, meta.kdf.iterations);
+            // AES-KW unwrap throws on bad key (integrity check built in). Do NOT catch here —
+            // the caller distinguishes "wrong passphrase" from other errors.
+            const dek = await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, kek);
+
+            // Read and decrypt the payload ciphertext. The saved vault we booted from is the
+            // best available on-disk record — read it fresh in case another tab wrote newer
+            // ciphertext during the unlock prompt.
+            const raw = readRawVault();
+            if (!raw?.ciphertext) throw new Error('Vault ciphertext missing');
+            const plaintext = await cryptoUtils.decrypt(dek, raw.ciphertext.iv, raw.ciphertext.data);
+            const state = sanitizeState(JSON.parse(plaintext));
+
+            currentDek = dek;
+            currentVault = { ...currentVault, security: raw.security || meta, savedAt: raw.savedAt || 0 };
+            applyUnlockedState(state);
+        }
+
+        // --- Lock UI ---
+        // The lock overlay covers the entire viewport and is opened both at cold boot (when the
+        // vault is encrypted) and later when the user locks manually or the idle timer fires.
+        // While `body.locked` is set, the sidebar/editor are visually hidden AND inert, so a
+        // stale DOM behind the overlay can't be interacted with even by keyboard.
+        function showLockOverlay(subtitle) {
+            document.body.classList.add('locked');
+            const overlay = document.getElementById('lock-overlay');
+            overlay.classList.add('open');
+            // visibility:hidden alone doesn't reliably prevent Tab focus; inert closes that gap.
+            document.getElementById('sidebar').setAttribute('inert', '');
+            document.getElementById('editor-wrapper').setAttribute('inert', '');
+            const sub = document.getElementById('lock-subtitle');
+            if (subtitle) sub.textContent = subtitle;
+            const meta = document.getElementById('lock-meta');
+            const savedAt = currentVault.savedAt ? new Date(currentVault.savedAt).toLocaleString() : null;
+            meta.textContent = savedAt ? `Last saved: ${savedAt}` : '';
+            document.getElementById('unlock-error').textContent = '';
+            document.getElementById('unlock-passphrase').value = '';
+            // Focus after the overlay is visible; autofocus on hidden inputs is unreliable.
+            setTimeout(() => document.getElementById('unlock-passphrase').focus(), 0);
+        }
+
+        function hideLockOverlay() {
+            document.body.classList.remove('locked');
+            document.getElementById('lock-overlay').classList.remove('open');
+            document.getElementById('sidebar').removeAttribute('inert');
+            document.getElementById('editor-wrapper').removeAttribute('inert');
+            document.getElementById('unlock-passphrase').value = '';
+        }
+
+        function applyUnlockedState(state) {
+            const s = store.getState();
+            // Replace the store's state wholesale by dispatching a synthetic action. Using the
+            // reducer keeps subscribers wired; using the sync channel would leak plaintext to
+            // other tabs, so we skip broadcast here — each tab unlocks independently.
+            store.dispatchFromSync({ type: '__HYDRATE__', state });
+            hideLockOverlay();
+            saveToStorage(store.getState());
+        }
+
+        function bindUnlockForm() {
+            const form = document.getElementById('unlock-form');
+            const errEl = document.getElementById('unlock-error');
+            const btn = document.getElementById('unlock-submit');
+            form.onsubmit = async (e) => {
+                e.preventDefault();
+                errEl.textContent = '';
+                const passphrase = document.getElementById('unlock-passphrase').value;
+                if (!passphrase) { errEl.textContent = 'Passphrase required.'; return; }
+                btn.disabled = true; btn.textContent = 'Unlocking…';
+                try {
+                    await unlockWithPassphrase(passphrase);
+                } catch(err) {
+                    // Don't distinguish "wrong passphrase" from "corrupt blob" in the message —
+                    // both are recoverable from the user's perspective only by trying again or
+                    // re-importing, and revealing which one it is helps an attacker enumerate.
+                    errEl.textContent = 'Incorrect passphrase.';
+                    console.warn('Unlock failed:', err);
+                } finally {
+                    btn.disabled = false; btn.textContent = 'Unlock';
+                }
+            };
+        }
+
+        // --- Security Panel ---
+        // Small dispatcher that renders the correct modal for the current vault mode. Kept as
+        // one entry point so the sidebar button never has to know whether encryption is on.
+        async function openSecurityPanel() {
+            if (currentVault.security.mode === 'plain') {
+                await openEnableEncryptionFlow();
+            } else {
+                await openEncryptedSecurityMenu();
+            }
+        }
+
+        async function openEnableEncryptionFlow() {
+            const fields = await modal.prompt({
+                title: 'Enable encryption',
+                body: 'Choose a passphrase to encrypt your notes at rest. This passphrase is not stored anywhere — if you lose it and have no other unlock method configured, your notes are unrecoverable.',
+                fields: [
+                    { name: 'passphrase', label: 'Passphrase', type: 'password', autofocus: true, autocomplete: 'new-password', help: 'At least 8 characters.' },
+                    { name: 'confirm', label: 'Confirm passphrase', type: 'password', autocomplete: 'new-password' }
+                ],
+                confirmLabel: 'Enable encryption',
+                validate: (vals) => {
+                    const errors = {};
+                    if (!vals.passphrase || vals.passphrase.length < 8) errors.passphrase = 'Use at least 8 characters.';
+                    if (vals.passphrase !== vals.confirm) errors.confirm = 'Passphrases do not match.';
+                    return Object.keys(errors).length ? errors : null;
+                }
+            });
+            if (!fields) return;
+            try {
+                await enableEncryption(fields.passphrase);
+                await modal.alert({
+                    title: 'Encryption enabled',
+                    body: 'Your notes are now encrypted at rest. Downloaded exports will carry the same encrypted payload — anyone opening them will need this passphrase.'
+                });
+            } catch(err) {
+                await modal.alert({ title: 'Failed to enable encryption', body: String(err.message || err) });
+            }
+        }
+
+        async function openEncryptedSecurityMenu() {
+            const choice = await modal.open({
+                title: 'Security',
+                body: 'Encryption is on. Your notes are stored as AES-256-GCM ciphertext in this browser and in any downloaded exports.',
+                buttons: [
+                    { label: 'Close', kind: 'default', value: 'close', autofocus: true },
+                    { label: 'Change passphrase', kind: 'primary', value: 'change' },
+                    { label: 'Disable encryption', kind: 'danger', value: 'disable' }
+                ]
+            });
+            if (choice.button === 'change') await openChangePassphraseFlow();
+            if (choice.button === 'disable') await openDisableEncryptionFlow();
+        }
+
+        async function openChangePassphraseFlow() {
+            const fields = await modal.prompt({
+                title: 'Change passphrase',
+                fields: [
+                    { name: 'old', label: 'Current passphrase', type: 'password', autofocus: true, autocomplete: 'current-password' },
+                    { name: 'next', label: 'New passphrase', type: 'password', autocomplete: 'new-password', help: 'At least 8 characters.' },
+                    { name: 'confirm', label: 'Confirm new passphrase', type: 'password', autocomplete: 'new-password' }
+                ],
+                confirmLabel: 'Change passphrase',
+                validate: (vals) => {
+                    const errors = {};
+                    if (!vals.old) errors.old = 'Required.';
+                    if (!vals.next || vals.next.length < 8) errors.next = 'Use at least 8 characters.';
+                    if (vals.next !== vals.confirm) errors.confirm = 'Passphrases do not match.';
+                    return Object.keys(errors).length ? errors : null;
+                }
+            });
+            if (!fields) return;
+            try {
+                await changePassphrase(fields.old, fields.next);
+                await modal.alert({ title: 'Passphrase changed', body: 'Your new passphrase is now the only one that will unlock this vault.' });
+            } catch(err) {
+                await modal.alert({ title: 'Passphrase change failed', body: 'Current passphrase was incorrect, or the vault is in an unexpected state.' });
+                console.warn('Change passphrase failed:', err);
+            }
+        }
+
+        async function openDisableEncryptionFlow() {
+            const ok = await modal.confirm({
+                title: 'Disable encryption?',
+                body: 'Your notes will be stored in plaintext in this browser and in any exports afterwards. Anyone with access to the storage or the exported file will be able to read them.',
+                confirmLabel: 'Disable encryption',
+                cancelLabel: 'Keep encrypted',
+                danger: true
+            });
+            if (!ok) return;
+            const fields = await modal.prompt({
+                title: 'Confirm passphrase to disable',
+                fields: [{ name: 'passphrase', label: 'Passphrase', type: 'password', autofocus: true, autocomplete: 'current-password' }],
+                confirmLabel: 'Disable encryption',
+                danger: true,
+                validate: (vals) => vals.passphrase ? null : { passphrase: 'Required.' }
+            });
+            if (!fields) return;
+            try {
+                await disableEncryption(fields.passphrase);
+                await modal.alert({ title: 'Encryption disabled', body: 'Your notes are now stored in plaintext.' });
+            } catch(err) {
+                await modal.alert({ title: 'Failed to disable', body: 'The passphrase you entered was incorrect.' });
+                console.warn('Disable encryption failed:', err);
+            }
+        }
 
         // --- Modal Component ---
         // A single reusable focus-trapped dialog. Native confirm/alert are unusable on installed
@@ -689,6 +1108,14 @@
             // Encrypted vaults will get their real state once the user unlocks. Boot the store
             // with an empty shell so subscribers and renderers don't have to special-case null.
             let initialState = boot.state ? sanitizeState(boot.state) : freshState();
+
+            bindUnlockForm();
+            if (boot.locked) {
+                showLockOverlay('Enter your passphrase to unlock your notes.');
+            }
+
+            store = createStore(initialState);
+            window.store = store; // test hook; `let` bindings aren't reachable via `window` otherwise
 
             // Subscriptions
             store.subscribe((state, action) => {
