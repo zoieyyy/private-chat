@@ -3,6 +3,21 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!--
+      Content Security Policy.
+      - No 'unsafe-inline' on script-src. Inline event handlers were moved to addEventListener.
+      - The one inline JS block is allowed only via its SHA-256 hash (below); modifying it
+        means recomputing the hash via `node tools/compute-csp-hash.mjs`. Both live-served
+        and exported HTML carry the same policy (exports are static copies of this file),
+        so an exported HTML tampered with in transit will refuse to execute injected code.
+      - style-src allows 'unsafe-inline' because inline styles are pervasive throughout the
+        app and, per the spec, are a much smaller attack surface than inline script.
+      - connect-src 'none': the app makes no network requests. localStorage, BroadcastChannel,
+        and navigator.credentials aren't subject to connect-src.
+      - frame-ancestors is header-only; it's applied via server config, not meta.
+      - object/base locked down to prevent embedding attacks and base tricks.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-EKmDbibLmyCTPr4fO2s4CGdebvE5FGeQPm/IhnPiccY='; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'">
     <title>Notes: File-Over-App</title>
     <style>
         :root[data-theme="light"] {
@@ -129,6 +144,84 @@
         #toast.visible { transform: translateX(-50%) translateY(0); }
         #toast button { background: transparent; border: none; color: var(--primary); font-weight: bold; cursor: pointer; }
 
+        /* Modal */
+        #modal-root {
+            position: fixed; inset: 0; z-index: 200;
+            display: none; align-items: center; justify-content: center;
+            background: rgba(15, 23, 42, 0.55);
+        }
+        #modal-root.open { display: flex; }
+        .modal-dialog {
+            background: var(--bg-card); color: var(--text-main);
+            border-radius: 10px; box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+            min-width: 340px; max-width: 480px; max-height: 90vh; width: calc(100% - 32px);
+            display: flex; flex-direction: column; overflow: hidden;
+            border: 1px solid var(--border-color);
+            animation: modal-in 0.15s ease-out;
+        }
+        @keyframes modal-in { from { transform: translateY(8px); opacity: 0.6; } to { transform: none; opacity: 1; } }
+        .modal-header { padding: 20px 24px 8px; }
+        .modal-title { font-size: 16px; font-weight: 600; margin: 0; }
+        .modal-body { padding: 8px 24px 12px; font-size: 14px; color: var(--text-muted); overflow-y: auto; }
+        .modal-body p { margin-bottom: 8px; line-height: 1.5; }
+        .modal-body p:last-child { margin-bottom: 0; }
+        .modal-body strong { color: var(--text-main); }
+
+        .modal-fields { padding: 4px 24px 12px; display: flex; flex-direction: column; gap: 12px; }
+        .modal-field label { display: block; font-size: 13px; margin-bottom: 4px; color: var(--text-main); font-weight: 500; }
+        .modal-field input {
+            width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px;
+            background: var(--bg-app); color: var(--text-main); font-size: 14px; outline: none; font-family: inherit;
+        }
+        .modal-field input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent); }
+        .modal-field .field-help { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+        .modal-field .field-error { font-size: 12px; color: var(--danger); margin-top: 4px; display: none; }
+        .modal-field.has-error .field-error { display: block; }
+        .modal-field.has-error input { border-color: var(--danger); }
+
+        .modal-footer {
+            padding: 12px 24px 20px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap;
+        }
+        .modal-btn {
+            padding: 8px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; font-family: inherit;
+            border: 1px solid var(--border-color); background: transparent; color: var(--text-main);
+        }
+        .modal-btn:hover { background: var(--hover-bg); }
+        .modal-btn.primary { background: var(--primary); color: white; border-color: var(--primary); }
+        .modal-btn.primary:hover { filter: brightness(0.95); }
+        .modal-btn.danger { background: var(--danger); color: white; border-color: var(--danger); }
+        .modal-btn.danger:hover { filter: brightness(0.95); }
+        .modal-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+        .modal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Lock Overlay */
+        #lock-overlay {
+            position: fixed; inset: 0; z-index: 300;
+            background: var(--bg-app); color: var(--text-main);
+            display: none; align-items: center; justify-content: center;
+            padding: 24px;
+        }
+        #lock-overlay.open { display: flex; }
+        .lock-card {
+            background: var(--bg-card); border: 1px solid var(--border-color);
+            border-radius: 12px; padding: 32px; max-width: 440px; width: 100%;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        }
+        .lock-card h1 { font-size: 22px; margin-bottom: 8px; }
+        .lock-card p { font-size: 14px; color: var(--text-muted); margin-bottom: 20px; line-height: 1.5; }
+        .lock-form { display: flex; flex-direction: column; gap: 12px; }
+        .lock-form label { font-size: 13px; font-weight: 500; }
+        .lock-form input {
+            width: 100%; padding: 10px 12px; border: 1px solid var(--border-color); border-radius: 6px;
+            background: var(--bg-app); color: var(--text-main); font-size: 14px; outline: none; font-family: inherit;
+        }
+        .lock-form input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent); }
+        .lock-error { font-size: 13px; color: var(--danger); min-height: 18px; }
+        .lock-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        .lock-actions button { flex: 1; min-width: 120px; }
+        .lock-meta { font-size: 12px; color: var(--text-muted); margin-top: 12px; }
+        body.locked #sidebar, body.locked #editor-wrapper { visibility: hidden; }
+
     </style>
 </head>
 <body>
@@ -138,14 +231,16 @@
             <div class="header-top">
                 <h3>Workspace</h3>
                 <div class="action-group">
-                    <button onclick="createFolder()">+ Folder</button>
-                    <button onclick="createNote()" style="background: var(--primary); color: white; border: none;">+ Note</button>
+                    <button id="new-folder-btn">+ Folder</button>
+                    <button id="new-note-btn" style="background: var(--primary); color: white; border: none;">+ Note</button>
                 </div>
             </div>
-            <input type="text" id="search-input" class="search-box" placeholder="Search (Cmd+/)..." oninput="handleSearch()">
-            <div class="action-group" style="margin-top: 8px; display: flex; gap: 4px;">
-                <button onclick="exportSelfContainedHtml()">Download App</button>
-                <button id="theme-toggle" onclick="toggleTheme()">Dark Mode</button>
+            <input type="text" id="search-input" class="search-box" placeholder="Search (Cmd+/)...">
+            <div class="action-group" style="margin-top: 8px; display: flex; gap: 4px; flex-wrap: wrap;">
+                <button id="export-btn">Download App</button>
+                <button id="theme-toggle">Dark Mode</button>
+                <button id="security-btn">Security</button>
+                <button id="lock-btn" title="Lock (Cmd+Shift+L)">Lock</button>
             </div>
         </div>
         <div id="tree-container"></div>
@@ -160,18 +255,18 @@
         <div id="editor-view">
             <div class="editor-card">
                 <div class="editor-top-bar">
-                    <select id="folder-select" class="folder-select" onchange="moveNote()"></select>
+                    <select id="folder-select" class="folder-select"></select>
                     <div style="display: flex; gap: 10px; align-items: center;">
-                        <label><input type="checkbox" id="preview-toggle" onchange="togglePreview()"> Preview</label>
+                        <label><input type="checkbox" id="preview-toggle"> Preview</label>
                         <span id="save-status">Saved</span>
                     </div>
                 </div>
-                <input type="text" id="note-title" placeholder="Note Title" oninput="handleInput()">
-                <textarea id="note-content" placeholder="Start typing (Markdown supported)..." oninput="handleInput()"></textarea>
+                <input type="text" id="note-title" placeholder="Note Title">
+                <textarea id="note-content" placeholder="Start typing (Markdown supported)..."></textarea>
                 <div id="preview-layer"></div>
                 <div class="editor-footer">
                     <span id="word-count">0 words</span>
-                    <button onclick="softDeleteActiveNote()">Delete Note</button>
+                    <button id="delete-note-btn">Delete Note</button>
                 </div>
             </div>
         </div>
@@ -179,7 +274,28 @@
 
     <div id="toast">
         <span id="toast-msg">Note deleted.</span>
-        <button onclick="undoDelete()">Undo</button>
+        <button id="undo-delete-btn">Undo</button>
+    </div>
+
+    <div id="modal-root" aria-hidden="true"></div>
+
+    <div id="lock-overlay" role="dialog" aria-modal="true" aria-labelledby="lock-title">
+        <div class="lock-card">
+            <h1 id="lock-title">Vault Locked</h1>
+            <p id="lock-subtitle">Enter your passphrase to unlock your notes.</p>
+            <form class="lock-form" id="unlock-form">
+                <div id="unlock-passphrase-field">
+                    <label for="unlock-passphrase">Passphrase</label>
+                    <input type="password" id="unlock-passphrase" autocomplete="current-password" autofocus>
+                </div>
+                <div class="lock-error" id="unlock-error" role="alert" aria-live="polite"></div>
+                <div class="lock-actions">
+                    <button type="submit" class="modal-btn primary" id="unlock-submit">Unlock</button>
+                    <button type="button" class="modal-btn" id="unlock-passkey-btn" hidden>Unlock with passkey</button>
+                </div>
+                <div class="lock-meta" id="lock-meta"></div>
+            </form>
+        </div>
     </div>
 
     <script id="app-data" type="application/json">null</script>
@@ -256,30 +372,95 @@
                     return { ...state, folders: state.folders.filter(f => f.id !== action.id), notes: state.notes.map(n => n.folderId === action.id ? { ...n, deletedAt: action.at } : n), activeNoteId: null };
                 case 'UI_SEARCH':
                     return { ...state, searchQuery: action.query };
+                case '__HYDRATE__':
+                    // Wholesale state replacement used only by unlock and app-lock flows.
+                    // Never broadcast (it carries decrypted plaintext); dispatch via
+                    // dispatchFromSync so the sync channel is bypassed.
+                    return action.state;
                 default:
                     return state;
             }
         }
 
-        // --- Initialization & Boot ---
-        function loadBootState() {
-            // Both sources are consulted and the freshest one wins (savedAt is stamped on
-            // every persist). Previously the embedded JSON always won, which meant edits
-            // made inside an exported file were silently thrown away on reload.
+        // --- Vault Layer ---
+        // The on-disk shape is a "vault": { vaultVersion, security: { mode }, state|ciphertext, savedAt }.
+        // security.mode = 'plain' stores state as-is; 'encrypted' stores AES-GCM ciphertext plus
+        // the metadata needed to re-derive the wrapping key(s). Splitting metadata from state lets
+        // encryption be added without touching reducers, and lets the boot flow decide whether to
+        // hand the app a decrypted state or a lock screen.
+        const VAULT_KEY = 'v4_store';
+        const VAULT_VERSION = 1;
+
+        // Some sandboxed contexts (data: URIs, some private-mode configurations, some CSP
+        // sandboxes) throw SecurityError on the mere property access `window.localStorage`.
+        // Wrap every read/write so the app keeps working from an embedded #app-data payload
+        // even when local persistence is unavailable — that's exactly the "opened an exported
+        // file in a fresh location" scenario the export flow is designed to support.
+        const safeStorage = {
+            get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+            set(key, value) { try { localStorage.setItem(key, value); } catch {} },
+            remove(key) { try { localStorage.removeItem(key); } catch {} }
+        };
+
+        function freshState() {
+            return { folders: [{ id: generateId(), name: "General", isExpanded: true }], notes: [], activeNoteId: null, searchQuery: '' };
+        }
+        function freshVaultMeta() {
+            return { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: 0 };
+        }
+
+        // Module-level vault metadata (security config + savedAt). Keeping this outside the
+        // Redux store means crypto material never flows through actions or the BroadcastChannel.
+        let currentVault = freshVaultMeta();
+
+        function readRawVault() {
             let embedded = null, local = null;
             try {
                 const e = JSON.parse(document.getElementById('app-data').textContent);
-                if (e && e.folders) embedded = e;
+                if (e && (e.folders || e.vaultVersion)) embedded = e;
             } catch(err) {}
             try {
-                const l = JSON.parse(localStorage.getItem('v4_store'));
-                if (l && l.folders) local = l;
+                const l = JSON.parse(safeStorage.get(VAULT_KEY));
+                if (l && (l.folders || l.vaultVersion)) local = l;
             } catch(err) {}
-
             if (embedded && local) return (embedded.savedAt || 0) > (local.savedAt || 0) ? embedded : local;
-            if (embedded || local) return embedded || local;
+            return embedded || local || null;
+        }
 
-            return { folders: [{ id: generateId(), name: "General", isExpanded: true }], notes: [], activeNoteId: null, searchQuery: '' };
+        // Returns { state, vault, locked }. state is null when the vault is encrypted and
+        // requires unlock. vault carries only non-secret metadata for the app to prompt against.
+        function loadBootVault() {
+            const raw = readRawVault();
+            if (!raw) return { state: freshState(), vault: freshVaultMeta(), locked: false };
+
+            // Backward-compat: pre-vault shape had folders at the top level.
+            if (raw.folders && !raw.vaultVersion) {
+                return {
+                    state: {
+                        folders: raw.folders,
+                        notes: Array.isArray(raw.notes) ? raw.notes : [],
+                        activeNoteId: raw.activeNoteId ?? null,
+                        searchQuery: typeof raw.searchQuery === 'string' ? raw.searchQuery : ''
+                    },
+                    vault: { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: raw.savedAt || 0 },
+                    locked: false
+                };
+            }
+
+            if (raw.vaultVersion === VAULT_VERSION && raw.security?.mode === 'plain') {
+                const s = raw.state && raw.state.folders ? raw.state : freshState();
+                return {
+                    state: s,
+                    vault: { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: raw.savedAt || 0 },
+                    locked: false
+                };
+            }
+
+            if (raw.vaultVersion === VAULT_VERSION && raw.security?.mode === 'encrypted') {
+                return { state: null, vault: raw, locked: true };
+            }
+
+            return { state: freshState(), vault: freshVaultMeta(), locked: false };
         }
 
         let store;
@@ -290,24 +471,1161 @@
         let toastTimeout;
         const TRASH_TTL_MS = 7 * 24 * 60 * 60 * 1000; // purge soft-deleted notes after 7 days
 
-        function init() {
-            let initialState = loadBootState();
+        // In-memory Data Encryption Key. Populated on unlock, wiped on lock. Never persisted,
+        // never broadcast. Declared here so plain-mode code paths can reference it defensively.
+        let currentDek = null;
 
-            // Guarantee at least one folder exists
-            if (!Array.isArray(initialState.folders) || initialState.folders.length === 0) {
-                initialState.folders = [{ id: generateId(), name: "General", isExpanded: true }];
+        // --- Crypto Utilities ---
+        // Envelope encryption primitives. AES-256-GCM for note content (authenticated encryption
+        // means wrong keys/tampered ciphertext fail decrypt cleanly, so we can distinguish wrong
+        // passphrase from corrupted blob without leaking which is which to the user). PBKDF2 with
+        // 600k iterations for passphrase→KEK (current OWASP floor for SHA-256; revisit as
+        // hardware improves — the iteration count is stored in the vault so we can raise it
+        // without breaking older exports). AES-KW to wrap the DEK under each KEK; this keeps the
+        // note ciphertext independent of the credential used to unlock, so adding a second
+        // credential doesn't require re-encrypting all notes.
+        const PBKDF2_ITERATIONS_DEFAULT = 600_000;
+        const PBKDF2_ITERATIONS_MIN = 600_000; // Refuse to derive with fewer than this many rounds even if a vault claims otherwise.
+        const HKDF_INFO_PASSKEY = 'notes-passkey-kek-v1';
+
+        const cryptoUtils = {
+            b64: {
+                encode(buf) {
+                    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+                    // Chunked to avoid "Maximum call stack size exceeded" on large ciphertexts.
+                    let s = '';
+                    const CHUNK = 0x8000;
+                    for (let i = 0; i < bytes.length; i += CHUNK) {
+                        s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+                    }
+                    return btoa(s);
+                },
+                decode(str) {
+                    const bin = atob(str);
+                    const out = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+                    return out;
+                }
+            },
+            b64url: {
+                encode(buf) {
+                    return cryptoUtils.b64.encode(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                },
+                decode(str) {
+                    const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+                    return cryptoUtils.b64.decode(str.replace(/-/g, '+').replace(/_/g, '/') + pad);
+                }
+            },
+            randomBytes(n) { return crypto.getRandomValues(new Uint8Array(n)); },
+
+            async encrypt(dek, plaintext) {
+                const iv = this.randomBytes(12);
+                const encoded = new TextEncoder().encode(plaintext);
+                const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, dek, encoded);
+                return { iv: this.b64.encode(iv), data: this.b64.encode(new Uint8Array(ct)) };
+            },
+            async decrypt(dek, ivB64, dataB64) {
+                const iv = this.b64.decode(ivB64);
+                const data = this.b64.decode(dataB64);
+                const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, dek, data);
+                return new TextDecoder().decode(pt);
+            },
+
+            async generateDek() {
+                // extractable=true so we can rewrap it when the user adds a passkey, changes the
+                // passphrase, or exports a vault re-keyed for a different credential.
+                return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+            },
+
+            async deriveKekFromPassphrase(passphrase, saltU8, iterations) {
+                if (iterations < PBKDF2_ITERATIONS_MIN) {
+                    throw new Error('PBKDF2 iteration count below policy minimum');
+                }
+                const material = await crypto.subtle.importKey(
+                    'raw', new TextEncoder().encode(passphrase),
+                    { name: 'PBKDF2' }, false, ['deriveKey']
+                );
+                return crypto.subtle.deriveKey(
+                    { name: 'PBKDF2', salt: saltU8, iterations, hash: 'SHA-256' },
+                    material,
+                    { name: 'AES-KW', length: 256 },
+                    false,
+                    ['wrapKey', 'unwrapKey']
+                );
+            },
+
+            async deriveKekFromPrf(prfOutput, saltU8) {
+                const material = await crypto.subtle.importKey(
+                    'raw', prfOutput, { name: 'HKDF' }, false, ['deriveKey']
+                );
+                return crypto.subtle.deriveKey(
+                    { name: 'HKDF', hash: 'SHA-256', salt: saltU8, info: new TextEncoder().encode(HKDF_INFO_PASSKEY) },
+                    material,
+                    { name: 'AES-KW', length: 256 },
+                    false,
+                    ['wrapKey', 'unwrapKey']
+                );
+            },
+
+            async wrapDek(dek, kek) {
+                const wrapped = await crypto.subtle.wrapKey('raw', dek, kek, 'AES-KW');
+                return this.b64.encode(new Uint8Array(wrapped));
+            },
+            async unwrapDek(wrappedB64, kek) {
+                const wrapped = this.b64.decode(wrappedB64);
+                return crypto.subtle.unwrapKey(
+                    'raw', wrapped, kek, 'AES-KW',
+                    { name: 'AES-GCM', length: 256 },
+                    true, ['encrypt', 'decrypt']
+                );
             }
-            if (!Array.isArray(initialState.notes)) initialState.notes = [];
-            if (typeof initialState.searchQuery !== 'string') initialState.searchQuery = '';
+        };
 
-            // Purge expired trash, sweep orphans, backfill timestamps
-            initialState.notes = initialState.notes.filter(n => !n.deletedAt || (now() - n.deletedAt) < TRASH_TTL_MS);
-            initialState.notes.forEach(n => {
-                if (!n.updatedAt) n.updatedAt = now();
-                if (!initialState.folders.some(f => f.id === n.folderId)) n.folderId = initialState.folders[0]?.id;
+        // --- Vault Encryption Operations ---
+        // All the state transitions between plain and encrypted vaults live here so they can be
+        // reasoned about as a unit. Each function is atomic: either the vault ends up in the
+        // requested target state with a valid persisted payload, or it stays in the source state
+        // with an error surfaced to the caller — we never leave localStorage half-migrated.
+
+        async function enableEncryption(passphrase) {
+            if (currentVault.security.mode !== 'plain') throw new Error('Vault is already encrypted');
+            const salt = cryptoUtils.randomBytes(16);
+            const iterations = PBKDF2_ITERATIONS_DEFAULT;
+            const kek = await cryptoUtils.deriveKekFromPassphrase(passphrase, salt, iterations);
+            const dek = await cryptoUtils.generateDek();
+            const wrappedPassphrase = await cryptoUtils.wrapDek(dek, kek);
+
+            currentDek = dek;
+            currentVault = {
+                vaultVersion: VAULT_VERSION,
+                security: {
+                    mode: 'encrypted',
+                    kdf: { name: 'PBKDF2-SHA256', iterations, salt: cryptoUtils.b64.encode(salt) },
+                    dekAlg: 'AES-256-GCM',
+                    wraps: {
+                        passphrase: { alg: 'AES-KW', wrapped: wrappedPassphrase },
+                        passkeys: []
+                    }
+                },
+                savedAt: now()
+            };
+            // Force an immediate encrypted save so the on-disk vault reflects the new mode
+            // atomically (rather than waiting for the next dispatch).
+            saveToStorage(store.getState());
+            renderTree(store.getState());
+            resetIdleTimer();
+        }
+
+        async function disableEncryption(passphrase) {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const meta = currentVault.security;
+            const salt = cryptoUtils.b64.decode(meta.kdf.salt);
+            const kek = await cryptoUtils.deriveKekFromPassphrase(passphrase, salt, meta.kdf.iterations);
+            // Unwrap purely to verify the passphrase; wrong passphrase throws. The current state
+            // is already decrypted in memory, so flipping to plain and re-saving needs no DEK.
+            await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, kek);
+            currentDek = null;
+            currentVault = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, savedAt: now() };
+            saveToStorage(store.getState());
+            renderTree(store.getState());
+            resetIdleTimer();
+        }
+
+        async function changePassphrase(oldPassphrase, newPassphrase) {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const meta = currentVault.security;
+            const oldSalt = cryptoUtils.b64.decode(meta.kdf.salt);
+            const oldKek = await cryptoUtils.deriveKekFromPassphrase(oldPassphrase, oldSalt, meta.kdf.iterations);
+            const dek = await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, oldKek);
+
+            const newSalt = cryptoUtils.randomBytes(16);
+            const iterations = PBKDF2_ITERATIONS_DEFAULT;
+            const newKek = await cryptoUtils.deriveKekFromPassphrase(newPassphrase, newSalt, iterations);
+            const newWrapped = await cryptoUtils.wrapDek(dek, newKek);
+
+            currentDek = dek;
+            currentVault = {
+                ...currentVault,
+                security: {
+                    ...meta,
+                    kdf: { name: 'PBKDF2-SHA256', iterations, salt: cryptoUtils.b64.encode(newSalt) },
+                    wraps: { ...meta.wraps, passphrase: { alg: 'AES-KW', wrapped: newWrapped } }
+                },
+                savedAt: now()
+            };
+            saveToStorage(store.getState());
+        }
+
+        // --- Passkey (WebAuthn PRF) Unlock ---
+        // Additive second unlock path. The passphrase remains the ultimate fallback — losing
+        // all passkeys is intentionally recoverable. Support is feature-detected; the button
+        // is hidden entirely on browsers/environments that don't expose WebAuthn, so users
+        // don't dead-end in a broken UI (per spec).
+        async function probePasskeySupport() {
+            if (!window.PublicKeyCredential || !navigator.credentials?.create) {
+                return { supported: false, prfLikely: false };
+            }
+            let clientCaps = null;
+            try {
+                if (typeof PublicKeyCredential.getClientCapabilities === 'function') {
+                    clientCaps = await PublicKeyCredential.getClientCapabilities();
+                }
+            } catch {}
+            // getClientCapabilities is authoritative-ish for client PRF support (Chrome 132+).
+            // Older browsers can't tell us — surface the option and discover at registration.
+            const prfLikely = clientCaps ? clientCaps.extensionPrf === true : true;
+            return { supported: true, prfLikely };
+        }
+
+        function currentRpId() {
+            // Passing rp.id explicitly on file:// (empty hostname) breaks WebAuthn. Let the
+            // browser default to the effective domain when there isn't a hostname.
+            return location.hostname && location.hostname !== '' ? location.hostname : undefined;
+        }
+
+        async function registerPasskey(label) {
+            if (!currentDek) throw new Error('Vault must be unlocked to add a passkey.');
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Enable encryption first.');
+            if (!window.PublicKeyCredential) throw new Error('WebAuthn is not available in this browser.');
+
+            const challenge = cryptoUtils.randomBytes(32);
+            const userId = cryptoUtils.randomBytes(16);
+            const prfSalt = cryptoUtils.randomBytes(32);
+            const rpId = currentRpId();
+
+            const cred = await navigator.credentials.create({
+                publicKey: {
+                    challenge,
+                    rp: { name: 'Private Notes', ...(rpId ? { id: rpId } : {}) },
+                    user: { id: userId, name: 'notes-vault', displayName: 'Notes Vault' },
+                    pubKeyCredParams: [
+                        { type: 'public-key', alg: -7 },   // ES256
+                        { type: 'public-key', alg: -257 }  // RS256
+                    ],
+                    authenticatorSelection: { userVerification: 'preferred', residentKey: 'preferred' },
+                    extensions: { prf: { eval: { first: prfSalt } } }
+                }
+            });
+            if (!cred) throw new Error('Passkey registration was cancelled.');
+
+            const clientExt = cred.getClientExtensionResults();
+            let prfOutput = clientExt?.prf?.results?.first;
+
+            // Not every authenticator exposes PRF at create() — some (iCloud Keychain,
+            // Google Password Manager) expose it only via get(). Retry once with the same
+            // salt before declaring PRF unsupported.
+            if (!prfOutput) {
+                try {
+                    const assertion = await navigator.credentials.get({
+                        publicKey: {
+                            challenge: cryptoUtils.randomBytes(32),
+                            allowCredentials: [{ id: cred.rawId, type: 'public-key' }],
+                            userVerification: 'preferred',
+                            ...(rpId ? { rpId } : {}),
+                            extensions: { prf: { eval: { first: prfSalt } } }
+                        }
+                    });
+                    prfOutput = assertion?.getClientExtensionResults()?.prf?.results?.first;
+                } catch (err) {
+                    console.warn('PRF probe on get() failed:', err);
+                }
+            }
+
+            if (!prfOutput) {
+                throw new Error('This authenticator does not support the PRF extension. Nothing was saved. Common causes: external security key on iOS Safari (platform limitation), or Windows Hello on a build older than 25H2 26200.7840.');
+            }
+
+            const hkdfSalt = cryptoUtils.randomBytes(32);
+            const kek = await cryptoUtils.deriveKekFromPrf(new Uint8Array(prfOutput), hkdfSalt);
+            const wrapped = await cryptoUtils.wrapDek(currentDek, kek);
+
+            const existing = currentVault.security.wraps?.passkeys || [];
+            const rec = {
+                credentialId: cryptoUtils.b64url.encode(new Uint8Array(cred.rawId)),
+                prfSalt: cryptoUtils.b64.encode(prfSalt),
+                hkdfSalt: cryptoUtils.b64.encode(hkdfSalt),
+                alg: 'AES-KW',
+                wrapped,
+                addedAt: now(),
+                label: label || 'Passkey'
+            };
+            currentVault = {
+                ...currentVault,
+                security: {
+                    ...currentVault.security,
+                    wraps: { ...currentVault.security.wraps, passkeys: [...existing, rec] }
+                },
+                savedAt: now()
+            };
+            saveToStorage(store.getState());
+            return rec;
+        }
+
+        async function unlockWithPasskey() {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const passkeys = currentVault.security.wraps?.passkeys || [];
+            if (passkeys.length === 0) throw new Error('No passkeys registered');
+            if (!window.PublicKeyCredential) throw new Error('WebAuthn not available in this browser');
+
+            // evalByCredential lets each registered passkey have its own PRF salt, so wraps
+            // are cryptographically independent (compromise of one PRF output doesn't imply
+            // anything about the others).
+            const evalByCredential = {};
+            const allowCredentials = passkeys.map(p => {
+                evalByCredential[p.credentialId] = { first: cryptoUtils.b64.decode(p.prfSalt) };
+                return { id: cryptoUtils.b64url.decode(p.credentialId), type: 'public-key' };
             });
 
+            const rpId = currentRpId();
+            const assertion = await navigator.credentials.get({
+                publicKey: {
+                    challenge: cryptoUtils.randomBytes(32),
+                    allowCredentials,
+                    userVerification: 'preferred',
+                    ...(rpId ? { rpId } : {}),
+                    extensions: { prf: { evalByCredential } }
+                }
+            });
+            if (!assertion) throw new Error('Passkey assertion cancelled');
+
+            const usedCredentialId = cryptoUtils.b64url.encode(new Uint8Array(assertion.rawId));
+            const passkey = passkeys.find(p => p.credentialId === usedCredentialId);
+            if (!passkey) throw new Error('Assertion did not match a registered passkey');
+
+            const prfOutput = assertion.getClientExtensionResults()?.prf?.results?.first;
+            if (!prfOutput) throw new Error('Authenticator did not return PRF output for this credential');
+
+            const hkdfSalt = cryptoUtils.b64.decode(passkey.hkdfSalt);
+            const kek = await cryptoUtils.deriveKekFromPrf(new Uint8Array(prfOutput), hkdfSalt);
+            const dek = await cryptoUtils.unwrapDek(passkey.wrapped, kek);
+
+            const raw = readRawVault();
+            if (!raw?.ciphertext) throw new Error('Vault ciphertext missing');
+            const plaintext = await cryptoUtils.decrypt(dek, raw.ciphertext.iv, raw.ciphertext.data);
+            const state = sanitizeState(JSON.parse(plaintext));
+
+            currentDek = dek;
+            currentVault = { ...currentVault, security: raw.security || currentVault.security, savedAt: raw.savedAt || 0 };
+            applyUnlockedState(state);
+        }
+
+        async function removePasskey(credentialId) {
+            const passkeys = currentVault.security.wraps?.passkeys || [];
+            const remaining = passkeys.filter(p => p.credentialId !== credentialId);
+            currentVault = {
+                ...currentVault,
+                security: {
+                    ...currentVault.security,
+                    wraps: { ...currentVault.security.wraps, passkeys: remaining }
+                },
+                savedAt: now()
+            };
+            saveToStorage(store.getState());
+        }
+
+        function updatePasskeyButtonVisibility() {
+            const btn = document.getElementById('unlock-passkey-btn');
+            if (!btn) return;
+            const hasPasskeys = (currentVault.security?.wraps?.passkeys || []).length > 0;
+            btn.hidden = !(hasPasskeys && !!window.PublicKeyCredential);
+        }
+
+        async function unlockWithPassphrase(passphrase) {
+            if (currentVault.security.mode !== 'encrypted') throw new Error('Vault is not encrypted');
+            const meta = currentVault.security;
+            const salt = cryptoUtils.b64.decode(meta.kdf.salt);
+            const kek = await cryptoUtils.deriveKekFromPassphrase(passphrase, salt, meta.kdf.iterations);
+            // AES-KW unwrap throws on bad key (integrity check built in). Do NOT catch here —
+            // the caller distinguishes "wrong passphrase" from other errors.
+            const dek = await cryptoUtils.unwrapDek(meta.wraps.passphrase.wrapped, kek);
+
+            // Read and decrypt the payload ciphertext. The saved vault we booted from is the
+            // best available on-disk record — read it fresh in case another tab wrote newer
+            // ciphertext during the unlock prompt.
+            const raw = readRawVault();
+            if (!raw?.ciphertext) throw new Error('Vault ciphertext missing');
+            const plaintext = await cryptoUtils.decrypt(dek, raw.ciphertext.iv, raw.ciphertext.data);
+            const state = sanitizeState(JSON.parse(plaintext));
+
+            currentDek = dek;
+            currentVault = { ...currentVault, security: raw.security || meta, savedAt: raw.savedAt || 0 };
+            applyUnlockedState(state);
+        }
+
+        // --- Lock UI ---
+        // The lock overlay covers the entire viewport and is opened both at cold boot (when the
+        // vault is encrypted) and later when the user locks manually or the idle timer fires.
+        // While `body.locked` is set, the sidebar/editor are visually hidden AND inert, so a
+        // stale DOM behind the overlay can't be interacted with even by keyboard.
+        function showLockOverlay(subtitle) {
+            document.body.classList.add('locked');
+            const overlay = document.getElementById('lock-overlay');
+            overlay.classList.add('open');
+            // visibility:hidden alone doesn't reliably prevent Tab focus; inert closes that gap.
+            document.getElementById('sidebar').setAttribute('inert', '');
+            document.getElementById('editor-wrapper').setAttribute('inert', '');
+            const sub = document.getElementById('lock-subtitle');
+            if (subtitle) sub.textContent = subtitle;
+            const meta = document.getElementById('lock-meta');
+            const savedAt = currentVault.savedAt ? new Date(currentVault.savedAt).toLocaleString() : null;
+            meta.textContent = savedAt ? `Last saved: ${savedAt}` : '';
+            document.getElementById('unlock-error').textContent = '';
+            document.getElementById('unlock-passphrase').value = '';
+            updatePasskeyButtonVisibility();
+            // Focus after the overlay is visible; autofocus on hidden inputs is unreliable.
+            // Focus the passphrase field when it's visible; the passkey button when it's the only control.
+            setTimeout(() => {
+                const passphraseField = document.getElementById('unlock-passphrase-field');
+                if (passphraseField && !passphraseField.hidden) {
+                    document.getElementById('unlock-passphrase').focus();
+                } else {
+                    document.getElementById('unlock-submit').focus();
+                }
+            }, 0);
+        }
+
+        function hideLockOverlay() {
+            document.body.classList.remove('locked');
+            document.getElementById('lock-overlay').classList.remove('open');
+            document.getElementById('sidebar').removeAttribute('inert');
+            document.getElementById('editor-wrapper').removeAttribute('inert');
+            document.getElementById('unlock-passphrase').value = '';
+        }
+
+        function applyUnlockedState(state) {
+            // Replace the store's state wholesale by dispatching a synthetic action. Using the
+            // reducer keeps subscribers wired; using the sync channel would leak plaintext to
+            // other tabs, so we skip broadcast here — each tab unlocks independently.
+            store.dispatchFromSync({ type: '__HYDRATE__', state });
+            hideLockOverlay();
+            saveToStorage(store.getState());
+        }
+
+        // Bind all previously-inline event handlers via addEventListener so we can drop
+        // 'unsafe-inline' from script-src. Called once from init(). Icons that live inside
+        // dynamically-rendered trees (folder headers, note items) already use JS listeners,
+        // so this only needs to cover the static shell.
+        function bindStaticListeners() {
+            document.getElementById('new-folder-btn').addEventListener('click', () => createFolder());
+            document.getElementById('new-note-btn').addEventListener('click', () => createNote());
+            document.getElementById('search-input').addEventListener('input', handleSearch);
+            document.getElementById('export-btn').addEventListener('click', () => exportSelfContainedHtml());
+            document.getElementById('theme-toggle').addEventListener('click', () => toggleTheme());
+            document.getElementById('security-btn').addEventListener('click', () => openSecurityPanel());
+            document.getElementById('lock-btn').addEventListener('click', () => lockApp('manual'));
+            document.getElementById('folder-select').addEventListener('change', moveNote);
+            document.getElementById('preview-toggle').addEventListener('change', togglePreview);
+            document.getElementById('note-title').addEventListener('input', handleInput);
+            document.getElementById('note-content').addEventListener('input', handleInput);
+            document.getElementById('delete-note-btn').addEventListener('click', () => softDeleteActiveNote());
+            document.getElementById('undo-delete-btn').addEventListener('click', () => undoDelete());
+        }
+
+        function bindUnlockForm() {
+            const form = document.getElementById('unlock-form');
+            const errEl = document.getElementById('unlock-error');
+            const btn = document.getElementById('unlock-submit');
+            const passkeyBtn = document.getElementById('unlock-passkey-btn');
+            passkeyBtn.onclick = async () => {
+                errEl.textContent = '';
+                passkeyBtn.disabled = true;
+                const origLabel = passkeyBtn.textContent;
+                passkeyBtn.textContent = 'Waiting for passkey…';
+                try {
+                    await unlockWithPasskey();
+                    isLocked = false;
+                    resetIdleTimer();
+                } catch(err) {
+                    // A cancelled prompt is a common case; downgrade to a neutral message.
+                    const isCancel = /cancell|not allowed|abort/i.test(String(err.message || err));
+                    errEl.textContent = isCancel
+                        ? 'Passkey unlock cancelled. Try again or use your passphrase.'
+                        : 'Passkey unlock failed. Try your passphrase.';
+                    console.warn('Passkey unlock failed:', err);
+                } finally {
+                    passkeyBtn.disabled = false;
+                    passkeyBtn.textContent = origLabel;
+                }
+            };
+            form.onsubmit = async (e) => {
+                e.preventDefault();
+                errEl.textContent = '';
+                if (currentVault.security.mode === 'plain') {
+                    // Plain-mode "lock" is just a screen-hide; no credential to verify.
+                    // Rehydrate state from the freshest on-disk copy and drop the overlay.
+                    const boot = loadBootVault();
+                    if (boot.state) store.dispatchFromSync({ type: '__HYDRATE__', state: sanitizeState(boot.state) });
+                    hideLockOverlay();
+                    isLocked = false;
+                    resetIdleTimer();
+                    return;
+                }
+                const passphrase = document.getElementById('unlock-passphrase').value;
+                if (!passphrase) { errEl.textContent = 'Passphrase required.'; return; }
+                btn.disabled = true; btn.textContent = 'Unlocking…';
+                try {
+                    await unlockWithPassphrase(passphrase);
+                    isLocked = false;
+                    resetIdleTimer();
+                } catch(err) {
+                    // Don't distinguish "wrong passphrase" from "corrupt blob" in the message —
+                    // both are recoverable from the user's perspective only by trying again or
+                    // re-importing, and revealing which one it is helps an attacker enumerate.
+                    errEl.textContent = 'Incorrect passphrase.';
+                    console.warn('Unlock failed:', err);
+                } finally {
+                    btn.disabled = false; btn.textContent = 'Unlock';
+                }
+            };
+        }
+
+        // --- App Lock ---
+        // Manual and idle lock. Locking must actually wipe decrypted state — clearing DEK from
+        // memory, resetting the store to an empty shell, and blanking the DOM inputs that hold
+        // decrypted title/content — not just overlay a lock screen on top of a live DOM.
+        // Idle lock is only armed for encrypted vaults; auto-locking a plain vault would only
+        // hide notes the operating-system user can already read from localStorage anyway.
+        let isLocked = false;
+        let idleTimerId = null;
+        let lastActivityAt = Date.now();
+        const AUTO_LOCK_KEY = 'v4_autolock_ms';
+        const AUTO_LOCK_DEFAULT_MS = 5 * 60 * 1000;
+        const AUTO_LOCK_OPTIONS = [
+            { label: 'Never', value: 0 },
+            { label: '1 minute', value: 60 * 1000 },
+            { label: '5 minutes', value: 5 * 60 * 1000 },
+            { label: '15 minutes', value: 15 * 60 * 1000 },
+            { label: '30 minutes', value: 30 * 60 * 1000 },
+            { label: '1 hour', value: 60 * 60 * 1000 }
+        ];
+
+        function getAutoLockMs() {
+            const v = parseInt(safeStorage.get(AUTO_LOCK_KEY), 10);
+            if (Number.isFinite(v) && v >= 0) return v;
+            return AUTO_LOCK_DEFAULT_MS;
+        }
+        function setAutoLockMs(ms) {
+            safeStorage.set(AUTO_LOCK_KEY, String(ms));
+            resetIdleTimer();
+        }
+
+        function resetIdleTimer() {
+            lastActivityAt = Date.now();
+            if (idleTimerId != null) { clearInterval(idleTimerId); idleTimerId = null; }
+            const timeout = getAutoLockMs();
+            // Idle lock is meaningful only when unlock actually costs something. In plain mode
+            // it's cosmetic and interrupts writing for no gain, so we skip arming it.
+            if (timeout <= 0 || isLocked) return;
+            if (currentVault.security?.mode !== 'encrypted') return;
+            // Check at a fraction of the interval so we don't fire more than one tick late.
+            const tick = Math.max(5000, Math.min(30000, Math.floor(timeout / 6)));
+            idleTimerId = setInterval(() => {
+                if (isLocked) return;
+                if (Date.now() - lastActivityAt >= timeout) {
+                    lockApp('idle');
+                }
+            }, tick);
+        }
+
+        function noteActivity() {
+            if (isLocked) return;
+            lastActivityAt = Date.now();
+        }
+
+        function installActivityListeners() {
+            // Throttle mousemove so we don't churn Date.now() on every pixel. Keydown / click /
+            // touch are the strong signals — mousemove alone can be triggered by external
+            // hardware (screen switcher, cursor jiggler) so we don't rely on it exclusively.
+            let lastMove = 0;
+            document.addEventListener('mousemove', () => {
+                const t = Date.now();
+                if (t - lastMove > 5000) { lastMove = t; noteActivity(); }
+            }, { passive: true });
+            for (const ev of ['keydown', 'click', 'touchstart', 'focus']) {
+                document.addEventListener(ev, noteActivity, { passive: true, capture: true });
+            }
+            // Locking a tab that's been backgrounded for the auto-lock timeout on wake is the
+            // whole point of idle lock; visibilitychange gives us a check-in on wake too.
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') {
+                    const timeout = getAutoLockMs();
+                    if (timeout > 0 && currentVault.security?.mode === 'encrypted' && !isLocked
+                        && Date.now() - lastActivityAt >= timeout) {
+                        lockApp('idle');
+                    }
+                }
+            });
+        }
+
+        function wipeDomForLock() {
+            // Clear input .value fields that hold decrypted plaintext — patchEditorState
+            // doesn't touch them when there's no active note, so they'd otherwise linger
+            // in the DOM inspectable to anyone with the running tab.
+            const t = document.getElementById('note-title'); if (t) t.value = '';
+            const c = document.getElementById('note-content'); if (c) c.value = '';
+            const s = document.getElementById('search-input'); if (s) s.value = '';
+            const tree = document.getElementById('tree-container'); if (tree) tree.innerHTML = '';
+            const preview = document.getElementById('preview-layer'); if (preview) preview.innerHTML = '';
+            const toast = document.getElementById('toast'); if (toast) toast.classList.remove('visible');
+        }
+
+        async function lockApp(reason) {
+            if (isLocked) return;
+            // Flush any pending encrypted save so the last edits land on disk BEFORE we drop the DEK.
+            // Losing a keystroke to a lock is worse than the extra ~ms it takes to encrypt one more time.
+            if (currentVault.security?.mode === 'encrypted' && currentDek) {
+                try {
+                    const payload = await buildVaultPayload(store.getState());
+                    safeStorage.set(VAULT_KEY, JSON.stringify(payload));
+                    currentVault.savedAt = payload.savedAt;
+                } catch(err) {
+                    console.warn('Failed to flush before lock:', err);
+                }
+            }
+            // Cancel any pending save; the state will be empty after hydrate and we don't want
+            // an empty-state ciphertext to overwrite the real one.
+            encryptSavePending = null;
+            currentDek = null;
+            isLocked = true;
+            if (idleTimerId != null) { clearInterval(idleTimerId); idleTimerId = null; }
+
+            store.dispatchFromSync({ type: '__HYDRATE__', state: freshState() });
+            wipeDomForLock();
+
+            if (currentVault.security?.mode === 'encrypted') {
+                document.getElementById('lock-title').textContent = 'Vault Locked';
+                document.getElementById('unlock-passphrase-field').hidden = false;
+                showLockOverlay(reason === 'idle'
+                    ? 'Auto-locked after inactivity. Enter your passphrase to continue.'
+                    : 'Enter your passphrase to unlock your notes.');
+            } else {
+                // Plain-mode "lock" is a screen-hide, not encryption. Be explicit about that
+                // in the overlay copy so users don't develop false confidence.
+                document.getElementById('lock-title').textContent = 'Notes hidden';
+                document.getElementById('unlock-passphrase-field').hidden = true;
+                showLockOverlay('This vault is not encrypted — anyone with access to this browser can still read your notes from storage. Click Unlock to bring them back.');
+            }
+        }
+
+        // --- Security Panel ---
+        // Small dispatcher that renders the correct modal for the current vault mode. Kept as
+        // one entry point so the sidebar button never has to know whether encryption is on.
+        async function openSecurityPanel() {
+            if (currentVault.security.mode === 'plain') {
+                await openEnableEncryptionFlow();
+            } else {
+                await openEncryptedSecurityMenu();
+            }
+        }
+
+        async function openEnableEncryptionFlow() {
+            const fields = await modal.prompt({
+                title: 'Enable encryption',
+                body: 'Choose a passphrase to encrypt your notes at rest. This passphrase is not stored anywhere — if you lose it and have no other unlock method configured, your notes are unrecoverable.',
+                fields: [
+                    { name: 'passphrase', label: 'Passphrase', type: 'password', autofocus: true, autocomplete: 'new-password', help: 'At least 8 characters.' },
+                    { name: 'confirm', label: 'Confirm passphrase', type: 'password', autocomplete: 'new-password' }
+                ],
+                confirmLabel: 'Enable encryption',
+                validate: (vals) => {
+                    const errors = {};
+                    if (!vals.passphrase || vals.passphrase.length < 8) errors.passphrase = 'Use at least 8 characters.';
+                    if (vals.passphrase !== vals.confirm) errors.confirm = 'Passphrases do not match.';
+                    return Object.keys(errors).length ? errors : null;
+                }
+            });
+            if (!fields) return;
+            try {
+                await enableEncryption(fields.passphrase);
+                await modal.alert({
+                    title: 'Encryption enabled',
+                    body: 'Your notes are now encrypted at rest. Downloaded exports will carry the same encrypted payload — anyone opening them will need this passphrase.'
+                });
+            } catch(err) {
+                await modal.alert({ title: 'Failed to enable encryption', body: String(err.message || err) });
+            }
+        }
+
+        async function openEncryptedSecurityMenu() {
+            // Build a rich body with the auto-lock timeout selector inline. Doing it as HTML
+            // lets the user change the timeout without an extra modal hop, which matters because
+            // this is where they'll actually go looking for it.
+            const body = document.createElement('div');
+            const p = document.createElement('p');
+            p.textContent = 'Encryption is on. Your notes are stored as AES-256-GCM ciphertext in this browser and in any downloaded exports.';
+            body.appendChild(p);
+
+            const timeoutWrap = document.createElement('div');
+            timeoutWrap.style.marginTop = '12px';
+            const timeoutLabel = document.createElement('label');
+            timeoutLabel.textContent = 'Auto-lock after inactivity: ';
+            timeoutLabel.style.color = 'var(--text-main)';
+            timeoutLabel.style.fontSize = '13px';
+            const select = document.createElement('select');
+            select.className = 'folder-select';
+            select.style.marginLeft = '8px';
+            const current = getAutoLockMs();
+            for (const opt of AUTO_LOCK_OPTIONS) {
+                const o = document.createElement('option');
+                o.value = String(opt.value); o.textContent = opt.label;
+                if (opt.value === current) o.selected = true;
+                select.appendChild(o);
+            }
+            select.onchange = () => setAutoLockMs(parseInt(select.value, 10) || 0);
+            timeoutLabel.htmlFor = select.id = 'autolock-select';
+            timeoutWrap.appendChild(timeoutLabel);
+            timeoutWrap.appendChild(select);
+            body.appendChild(timeoutWrap);
+
+            // Hide the passkey option entirely when WebAuthn is missing or the client reports
+            // PRF as definitively unsupported — per spec, don't dead-end users in a broken UI.
+            const support = await probePasskeySupport();
+            const passkeysAvailable = support.supported && support.prfLikely;
+            const buttons = [
+                { label: 'Close', kind: 'default', value: 'close', autofocus: true },
+                { label: 'Change passphrase', kind: 'primary', value: 'change' }
+            ];
+            if (passkeysAvailable) buttons.push({ label: 'Manage passkeys', kind: 'default', value: 'passkeys' });
+            buttons.push({ label: 'Disable encryption', kind: 'danger', value: 'disable' });
+
+            const choice = await modal.open({ title: 'Security', body, buttons });
+            if (choice.button === 'change') await openChangePassphraseFlow();
+            if (choice.button === 'passkeys') await openManagePasskeys();
+            if (choice.button === 'disable') await openDisableEncryptionFlow();
+        }
+
+        async function openManagePasskeys() {
+            const support = await probePasskeySupport();
+            const available = support.supported && support.prfLikely;
+            const passkeys = currentVault.security?.wraps?.passkeys || [];
+
+            const body = document.createElement('div');
+            const intro = document.createElement('p');
+            intro.textContent = available
+                ? 'Passkeys let you unlock without typing your passphrase. Your passphrase always still works, so losing a passkey is safe — but losing this device\'s passkey without also knowing your passphrase means permanent data loss.'
+                : 'Passkey unlock is not available in this browser — use your passphrase.';
+            body.appendChild(intro);
+
+            if (passkeys.length) {
+                const list = document.createElement('ul');
+                list.style.listStyle = 'none'; list.style.padding = '0'; list.style.margin = '12px 0 0';
+                for (const pk of passkeys) {
+                    const li = document.createElement('li');
+                    li.style.display = 'flex'; li.style.justifyContent = 'space-between'; li.style.alignItems = 'center';
+                    li.style.padding = '10px 0'; li.style.borderTop = '1px solid var(--border-color)';
+                    const info = document.createElement('div');
+                    info.style.color = 'var(--text-main)';
+                    const label = document.createElement('div');
+                    label.textContent = pk.label || 'Passkey'; label.style.fontWeight = '500';
+                    const date = document.createElement('div');
+                    date.textContent = 'Added ' + new Date(pk.addedAt).toLocaleDateString();
+                    date.style.fontSize = '11px'; date.style.color = 'var(--text-muted)';
+                    info.appendChild(label); info.appendChild(date);
+                    const rm = document.createElement('button');
+                    rm.className = 'modal-btn'; rm.textContent = 'Remove';
+                    rm.onclick = async () => {
+                        // Close the manage dialog first — the modal system shows one dialog at a
+                        // time, so a confirm opened while this one is up would queue invisibly.
+                        modal.closeCurrent();
+                        const ok = await modal.confirm({
+                            title: 'Remove passkey?',
+                            body: `Remove "${pk.label || 'this passkey'}"? Your passphrase (and any other registered passkeys) will still unlock the vault.`,
+                            danger: true,
+                            confirmLabel: 'Remove passkey'
+                        });
+                        if (ok) await removePasskey(pk.credentialId);
+                        openManagePasskeys(); // return to the (refreshed) list either way
+                    };
+                    li.appendChild(info); li.appendChild(rm);
+                    list.appendChild(li);
+                }
+                body.appendChild(list);
+            } else if (available) {
+                const empty = document.createElement('p');
+                empty.textContent = 'No passkeys registered yet.';
+                empty.style.marginTop = '8px';
+                body.appendChild(empty);
+            }
+
+            const choice = await modal.open({
+                title: 'Passkeys',
+                body,
+                buttons: available
+                    ? [
+                        { label: 'Close', kind: 'default', value: 'close', autofocus: true },
+                        { label: 'Add passkey', kind: 'primary', value: 'add' }
+                    ]
+                    : [{ label: 'Close', kind: 'default', value: 'close', autofocus: true }]
+            });
+            if (choice.button === 'add') await addPasskeyFlow();
+        }
+
+        async function addPasskeyFlow() {
+            const fields = await modal.prompt({
+                title: 'Add a passkey',
+                body: 'Use your device biometric or security key to unlock without typing your passphrase.\n\nLosing this device\'s passkey without also knowing your passphrase means permanent data loss for anyone who relies on that passkey alone.',
+                fields: [{ name: 'label', label: 'Label', type: 'text', value: '', placeholder: 'e.g. MacBook, iPhone', autofocus: true }],
+                confirmLabel: 'Register'
+            });
+            if (!fields) return;
+            try {
+                await registerPasskey(fields.label || 'Passkey');
+                await modal.alert({ title: 'Passkey registered', body: 'You can now unlock this vault with your passkey.' });
+            } catch (err) {
+                await modal.alert({ title: 'Registration failed', body: String(err.message || err) });
+            }
+        }
+
+        async function openChangePassphraseFlow() {
+            const fields = await modal.prompt({
+                title: 'Change passphrase',
+                fields: [
+                    { name: 'old', label: 'Current passphrase', type: 'password', autofocus: true, autocomplete: 'current-password' },
+                    { name: 'next', label: 'New passphrase', type: 'password', autocomplete: 'new-password', help: 'At least 8 characters.' },
+                    { name: 'confirm', label: 'Confirm new passphrase', type: 'password', autocomplete: 'new-password' }
+                ],
+                confirmLabel: 'Change passphrase',
+                validate: (vals) => {
+                    const errors = {};
+                    if (!vals.old) errors.old = 'Required.';
+                    if (!vals.next || vals.next.length < 8) errors.next = 'Use at least 8 characters.';
+                    if (vals.next !== vals.confirm) errors.confirm = 'Passphrases do not match.';
+                    return Object.keys(errors).length ? errors : null;
+                }
+            });
+            if (!fields) return;
+            try {
+                await changePassphrase(fields.old, fields.next);
+                await modal.alert({ title: 'Passphrase changed', body: 'Your new passphrase is now the only one that will unlock this vault.' });
+            } catch(err) {
+                await modal.alert({ title: 'Passphrase change failed', body: 'Current passphrase was incorrect, or the vault is in an unexpected state.' });
+                console.warn('Change passphrase failed:', err);
+            }
+        }
+
+        async function openDisableEncryptionFlow() {
+            const ok = await modal.confirm({
+                title: 'Disable encryption?',
+                body: 'Your notes will be stored in plaintext in this browser and in any exports afterwards. Anyone with access to the storage or the exported file will be able to read them.',
+                confirmLabel: 'Disable encryption',
+                cancelLabel: 'Keep encrypted',
+                danger: true
+            });
+            if (!ok) return;
+            const fields = await modal.prompt({
+                title: 'Confirm passphrase to disable',
+                fields: [{ name: 'passphrase', label: 'Passphrase', type: 'password', autofocus: true, autocomplete: 'current-password' }],
+                confirmLabel: 'Disable encryption',
+                danger: true,
+                validate: (vals) => vals.passphrase ? null : { passphrase: 'Required.' }
+            });
+            if (!fields) return;
+            try {
+                await disableEncryption(fields.passphrase);
+                await modal.alert({ title: 'Encryption disabled', body: 'Your notes are now stored in plaintext.' });
+            } catch(err) {
+                await modal.alert({ title: 'Failed to disable', body: 'The passphrase you entered was incorrect.' });
+                console.warn('Disable encryption failed:', err);
+            }
+        }
+
+        // --- Modal Component ---
+        // A single reusable focus-trapped dialog. Native confirm/alert are unusable on installed
+        // iOS PWAs (they can silently no-op) and are globally dismissible in ways that make
+        // destructive-action confirmations dangerous — a stray Enter can confirm a delete you
+        // never wanted. This component:
+        //   • role="alertdialog" with aria-labelledby / aria-describedby
+        //   • traps Tab focus inside the dialog
+        //   • Escape maps to Cancel only when a cancel button exists (`dismissible: true`)
+        //   • never auto-focuses a destructive button, so keyboard Enter can't accidentally trigger it
+        //   • marks the rest of the page `inert`, so background clicks/keys can't reach the app
+        const modal = (() => {
+            const root = document.getElementById('modal-root');
+            let currentClose = null; // resolver for the in-flight modal; null when nothing open
+
+            function backgroundEls() {
+                return Array.from(document.body.children).filter(el => el.id !== 'modal-root' && el.id !== 'toast');
+            }
+
+            function focusables(container) {
+                return Array.from(container.querySelectorAll(
+                    'input:not([disabled]), button:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+                )).filter(el => el.offsetParent !== null || el === document.activeElement);
+            }
+
+            function open(opts) {
+                if (currentClose) {
+                    // Queue: wait for the current modal to close before opening the next.
+                    // Poll every 50ms — simpler than plumbing a queue, and modal churn is rare.
+                    return (async () => {
+                        while (currentClose) await new Promise(r => setTimeout(r, 50));
+                        return open(opts);
+                    })();
+                }
+
+                const {
+                    title = '',
+                    body = '',
+                    fields = [],
+                    buttons = [{ label: 'OK', kind: 'primary', value: true, autofocus: true }],
+                    dismissible = true,
+                    submitOnEnter = false,
+                    validate = null
+                } = opts;
+
+                return new Promise((resolve) => {
+                    root.innerHTML = '';
+                    const dialog = document.createElement('div');
+                    dialog.className = 'modal-dialog';
+                    dialog.setAttribute('role', 'alertdialog');
+                    dialog.setAttribute('aria-modal', 'true');
+
+                    const titleId = 'modal-title-' + generateId();
+                    const bodyId = 'modal-body-' + generateId();
+                    if (title) dialog.setAttribute('aria-labelledby', titleId);
+                    if (body) dialog.setAttribute('aria-describedby', bodyId);
+
+                    if (title) {
+                        const h = document.createElement('div');
+                        h.className = 'modal-header';
+                        const t = document.createElement('h2');
+                        t.className = 'modal-title'; t.id = titleId;
+                        t.textContent = title;
+                        h.appendChild(t);
+                        dialog.appendChild(h);
+                    }
+
+                    if (body) {
+                        const b = document.createElement('div');
+                        b.className = 'modal-body'; b.id = bodyId;
+                        if (typeof body === 'string') {
+                            body.split('\n\n').forEach(para => {
+                                const p = document.createElement('p');
+                                p.textContent = para;
+                                b.appendChild(p);
+                            });
+                        } else if (body instanceof Node) {
+                            b.appendChild(body);
+                        }
+                        dialog.appendChild(b);
+                    }
+
+                    const fieldEls = {};
+                    if (fields.length) {
+                        const fieldsWrap = document.createElement('div');
+                        fieldsWrap.className = 'modal-fields';
+                        fields.forEach(f => {
+                            const wrap = document.createElement('div');
+                            wrap.className = 'modal-field';
+                            const label = document.createElement('label');
+                            label.textContent = f.label || f.name;
+                            const inputId = 'modal-field-' + generateId();
+                            label.htmlFor = inputId;
+                            const input = document.createElement('input');
+                            input.id = inputId;
+                            input.type = f.type || 'text';
+                            input.autocomplete = f.autocomplete || 'off';
+                            if (f.placeholder) input.placeholder = f.placeholder;
+                            if (f.value != null) input.value = f.value;
+                            if (f.autofocus) input.dataset.autofocus = '1';
+                            wrap.appendChild(label);
+                            wrap.appendChild(input);
+                            if (f.help) {
+                                const help = document.createElement('div');
+                                help.className = 'field-help';
+                                help.textContent = f.help;
+                                wrap.appendChild(help);
+                            }
+                            const err = document.createElement('div');
+                            err.className = 'field-error';
+                            wrap.appendChild(err);
+                            fieldsWrap.appendChild(wrap);
+                            fieldEls[f.name] = { input, wrap, err };
+                        });
+                        dialog.appendChild(fieldsWrap);
+                    }
+
+                    const footer = document.createElement('div');
+                    footer.className = 'modal-footer';
+                    const btnEls = [];
+                    // Sanity: never auto-focus a destructive button, regardless of caller intent.
+                    const hasDangerAutofocus = buttons.some(b => b.autofocus && b.kind === 'danger');
+                    if (hasDangerAutofocus) console.warn('Refusing to autofocus a destructive button.');
+                    buttons.forEach(bt => {
+                        const btn = document.createElement('button');
+                        btn.className = 'modal-btn' + (bt.kind && bt.kind !== 'default' ? ' ' + bt.kind : '');
+                        btn.textContent = bt.label;
+                        btn.type = 'button';
+                        if (bt.autofocus && bt.kind !== 'danger') btn.dataset.autofocus = '1';
+                        btn.onclick = () => submit(bt.value);
+                        footer.appendChild(btn);
+                        btnEls.push({ btn, spec: bt });
+                    });
+                    dialog.appendChild(footer);
+
+                    root.appendChild(dialog);
+                    root.classList.add('open');
+                    root.setAttribute('aria-hidden', 'false');
+
+                    const prevActive = document.activeElement;
+                    const bgEls = backgroundEls();
+                    bgEls.forEach(el => el.setAttribute('inert', ''));
+
+                    const cancelBtn = btnEls.find(b => b.spec.value === false || b.spec.value == null);
+                    const cancelValue = cancelBtn ? cancelBtn.spec.value : null;
+                    const primaryBtn = btnEls.find(b => b.spec.kind === 'primary' || b.spec.kind === 'danger');
+
+                    function submit(value) {
+                        if (value === true && validate) {
+                            const vals = collectFieldValues();
+                            const errors = validate(vals);
+                            if (errors) {
+                                applyErrors(errors);
+                                return;
+                            }
+                        }
+                        cleanup();
+                        const result = { button: value };
+                        if (fields.length) result.fields = collectFieldValues();
+                        resolve(result);
+                    }
+                    function collectFieldValues() {
+                        const out = {};
+                        for (const [name, { input }] of Object.entries(fieldEls)) out[name] = input.value;
+                        return out;
+                    }
+                    function applyErrors(errors) {
+                        for (const [name, entry] of Object.entries(fieldEls)) {
+                            if (errors[name]) {
+                                entry.wrap.classList.add('has-error');
+                                entry.err.textContent = errors[name];
+                            } else {
+                                entry.wrap.classList.remove('has-error');
+                                entry.err.textContent = '';
+                            }
+                        }
+                        // Focus the first errored field for keyboard users.
+                        const first = Object.keys(errors)[0];
+                        if (first && fieldEls[first]) fieldEls[first].input.focus();
+                    }
+                    function cleanup() {
+                        root.classList.remove('open');
+                        root.setAttribute('aria-hidden', 'true');
+                        root.innerHTML = '';
+                        bgEls.forEach(el => el.removeAttribute('inert'));
+                        document.removeEventListener('keydown', onKey, true);
+                        currentClose = null;
+                        if (prevActive && typeof prevActive.focus === 'function') {
+                            try { prevActive.focus(); } catch {}
+                        }
+                    }
+                    function onKey(e) {
+                        if (e.key === 'Escape') {
+                            if (!dismissible) { e.preventDefault(); return; }
+                            e.preventDefault();
+                            submit(cancelValue);
+                            return;
+                        }
+                        if (e.key === 'Tab') {
+                            const items = focusables(dialog);
+                            if (items.length === 0) return;
+                            const first = items[0], last = items[items.length - 1];
+                            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+                            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+                            return;
+                        }
+                        if (e.key === 'Enter' && submitOnEnter && e.target.tagName === 'INPUT') {
+                            e.preventDefault();
+                            if (primaryBtn) primaryBtn.btn.click();
+                        }
+                    }
+
+                    document.addEventListener('keydown', onKey, true);
+                    currentClose = () => submit(cancelValue);
+
+                    // Initial focus: honored autofocus, else first field, else first non-destructive button.
+                    setTimeout(() => {
+                        const autofocusEl = dialog.querySelector('[data-autofocus="1"]');
+                        if (autofocusEl) { autofocusEl.focus(); return; }
+                        const firstField = dialog.querySelector('.modal-field input');
+                        if (firstField) { firstField.focus(); return; }
+                        const safeBtn = btnEls.find(b => b.spec.kind !== 'danger');
+                        if (safeBtn) safeBtn.btn.focus();
+                    }, 0);
+                });
+            }
+
+            async function confirm({ title, body, danger = false, confirmLabel = 'Confirm', cancelLabel = 'Cancel' }) {
+                const res = await open({
+                    title, body,
+                    buttons: [
+                        { label: cancelLabel, kind: 'default', value: false, autofocus: true },
+                        { label: confirmLabel, kind: danger ? 'danger' : 'primary', value: true }
+                    ],
+                    dismissible: true
+                });
+                return res.button === true;
+            }
+
+            async function alert({ title, body, okLabel = 'OK' }) {
+                await open({
+                    title, body,
+                    buttons: [{ label: okLabel, kind: 'primary', value: true, autofocus: true }],
+                    dismissible: true
+                });
+            }
+
+            async function prompt({ title, body, fields, confirmLabel = 'OK', cancelLabel = 'Cancel', danger = false, dismissible = true, validate = null }) {
+                const res = await open({
+                    title, body, fields, dismissible, submitOnEnter: true, validate,
+                    buttons: [
+                        { label: cancelLabel, kind: 'default', value: false },
+                        { label: confirmLabel, kind: danger ? 'danger' : 'primary', value: true }
+                    ]
+                });
+                if (res.button !== true) return null;
+                return res.fields;
+            }
+
+            // closeCurrent cancels the open dialog (resolving its promise with the cancel value).
+            // Used when a control inside a dialog body needs to hand off to a follow-up dialog.
+            function closeCurrent() { if (currentClose) currentClose(); }
+
+            return { open, confirm, alert, prompt, closeCurrent };
+        })();
+
+        function sanitizeState(s) {
+            if (!Array.isArray(s.folders) || s.folders.length === 0) {
+                s.folders = [{ id: generateId(), name: "General", isExpanded: true }];
+            }
+            if (!Array.isArray(s.notes)) s.notes = [];
+            if (typeof s.searchQuery !== 'string') s.searchQuery = '';
+            s.notes = s.notes.filter(n => !n.deletedAt || (now() - n.deletedAt) < TRASH_TTL_MS);
+            s.notes.forEach(n => {
+                if (!n.updatedAt) n.updatedAt = now();
+                if (!s.folders.some(f => f.id === n.folderId)) n.folderId = s.folders[0]?.id;
+            });
+            return s;
+        }
+
+        function init() {
+            const boot = loadBootVault();
+            currentVault = boot.vault;
+
+            // Encrypted vaults will get their real state once the user unlocks. Boot the store
+            // with an empty shell so subscribers and renderers don't have to special-case null.
+            let initialState = boot.state ? sanitizeState(boot.state) : freshState();
+
+            bindStaticListeners();
+            bindUnlockForm();
+            installActivityListeners();
+            if (boot.locked) {
+                isLocked = true;
+                showLockOverlay('Enter your passphrase to unlock your notes.');
+            }
+
             store = createStore(initialState);
+            window.store = store; // test hook; `let` bindings aren't reachable via `window` otherwise
 
             // Subscriptions
             store.subscribe((state, action) => {
@@ -323,13 +1641,21 @@
                 patchEditorState(state);
             });
 
-            syncChannel.onmessage = (e) => store.dispatchFromSync(e.data);
+            syncChannel.onmessage = (e) => {
+                // Ignore actions from other tabs while we're locked — our state is intentionally
+                // wiped, and applying edits to freshState would corrupt what unlock rehydrates.
+                if (isLocked) return;
+                store.dispatchFromSync(e.data);
+            };
 
             // Initial render
             const state = store.getState();
-            if (localStorage.getItem('v4_theme') === 'dark') toggleTheme(true);
+            if (safeStorage.get('v4_theme') === 'dark') toggleTheme(true);
             renderTree(state);
             patchEditorState(state);
+
+            // Arm the idle timer only once the vault mode is known and (in encrypted mode) unlocked.
+            if (!boot.locked) resetIdleTimer();
         }
 
         // --- Actions & Dispatchers ---
@@ -459,10 +1785,25 @@
 
                 const delBtn = document.createElement('button');
                 delBtn.className = 'icon-btn delete'; delBtn.textContent = '✕'; delBtn.title = 'Delete';
-                delBtn.onclick = (e) => {
+                delBtn.setAttribute('aria-label', 'Delete folder ' + folder.name);
+                delBtn.onclick = async (e) => {
                     e.stopPropagation();
-                    if (store.getState().folders.length <= 1) { alert('Cannot delete the last folder.'); return; }
-                    if (confirm('Delete folder and notes?')) dispatch({ type: 'FOLDER_DELETE', id: folder.id, at: now() });
+                    if (store.getState().folders.length <= 1) {
+                        await modal.alert({ title: 'Cannot delete', body: 'You must keep at least one folder.' });
+                        return;
+                    }
+                    const notesInFolder = store.getState().notes.filter(n => n.folderId === folder.id && !n.deletedAt).length;
+                    const bodyText = notesInFolder > 0
+                        ? `"${folder.name}" contains ${notesInFolder} note${notesInFolder === 1 ? '' : 's'}. Deleting the folder moves them to the trash for 7 days before they are purged.`
+                        : `Delete the empty folder "${folder.name}"?`;
+                    const ok = await modal.confirm({
+                        title: 'Delete folder?',
+                        body: bodyText,
+                        confirmLabel: 'Delete folder',
+                        cancelLabel: 'Keep folder',
+                        danger: true
+                    });
+                    if (ok) dispatch({ type: 'FOLDER_DELETE', id: folder.id, at: now() });
                 };
 
                 actions.append(addBtn, editBtn, delBtn);
@@ -549,16 +1890,62 @@
         }
 
         // --- Utilities ---
-        function saveToStorage(state) {
-            // Because localStorage is synchronous, saving on every stroke is safe from data-loss.
-            // Performance is maintained because we only patch the DOM instead of re-rendering.
-            // savedAt lets loadBootState pick the freshest of embedded JSON vs localStorage.
-            try {
-                localStorage.setItem('v4_store', JSON.stringify({ ...state, savedAt: now() }));
-            } catch(e) {
-                // Quota exceeded or storage unavailable (private mode) — the in-memory
-                // state and the "Download App" export still work.
+        // Serialize the current state into a vault payload for localStorage / export. In plain mode
+        // this is trivially the state; in encrypted mode this becomes AES-GCM ciphertext plus the
+        // wrap metadata needed to unlock it on a fresh device. This function is the single point
+        // where in-memory state becomes on-disk bytes, which makes it the correct place to enforce
+        // "encrypted vaults must be unlocked to save."
+        async function buildVaultPayload(state) {
+            const savedAt = now();
+            const mode = currentVault.security?.mode || 'plain';
+            if (mode === 'plain') {
+                return { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, state, savedAt };
             }
+            if (mode === 'encrypted') {
+                if (!currentDek) throw new Error('Encrypted vault is locked; cannot save');
+                const plaintext = JSON.stringify(state);
+                const { iv, data } = await cryptoUtils.encrypt(currentDek, plaintext);
+                return {
+                    vaultVersion: VAULT_VERSION,
+                    security: currentVault.security,
+                    ciphertext: { alg: 'AES-256-GCM', iv, data },
+                    savedAt
+                };
+            }
+            throw new Error('Unknown vault mode: ' + mode);
+        }
+
+        // saveToStorage is called synchronously from every dispatch (including keystrokes).
+        // Plain mode writes inline. Encrypted mode chains async encryption behind a
+        // latest-wins queue: rapid keystrokes coalesce into at most one in-flight save
+        // plus one pending save, so we never queue up an unbounded backlog of encryptions
+        // and the most recent state always ends up on disk.
+        let encryptSavePending = null;
+        let encryptSaveInFlight = false;
+        function saveToStorage(state) {
+            const mode = currentVault.security?.mode || 'plain';
+            if (mode === 'plain') {
+                const payload = { vaultVersion: VAULT_VERSION, security: { mode: 'plain' }, state, savedAt: now() };
+                safeStorage.set(VAULT_KEY, JSON.stringify(payload));
+                currentVault.savedAt = payload.savedAt;
+                return;
+            }
+            encryptSavePending = state;
+            if (encryptSaveInFlight) return;
+            encryptSaveInFlight = true;
+            (async () => {
+                try {
+                    while (encryptSavePending) {
+                        const toSave = encryptSavePending;
+                        encryptSavePending = null;
+                        const payload = await buildVaultPayload(toSave);
+                        safeStorage.set(VAULT_KEY, JSON.stringify(payload));
+                        currentVault.savedAt = payload.savedAt;
+                    }
+                } finally {
+                    encryptSaveInFlight = false;
+                }
+            })();
         }
 
         function showToast() {
@@ -571,7 +1958,7 @@
         function toggleTheme(forceDark) {
             const isDark = typeof forceDark === 'boolean' ? forceDark : document.documentElement.getAttribute('data-theme') === 'light';
             document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
-            localStorage.setItem('v4_theme', isDark ? 'dark' : 'light');
+            safeStorage.set('v4_theme', isDark ? 'dark' : 'light');
             document.getElementById('theme-toggle').textContent = isDark ? 'Light Mode' : 'Dark Mode';
         }
 
@@ -607,15 +1994,28 @@
         }
 
         // The "File-Over-App" Export Engine
-        function exportSelfContainedHtml() {
+        // Exports carry the same vault payload as localStorage — plain or encrypted, including
+        // all wrap metadata — so an exported HTML opened cold on a new device is exactly as
+        // protected as (and identically restorable as) the browser copy it came from.
+        async function exportSelfContainedHtml() {
             const html = document.documentElement.cloneNode(true);
             const dataScript = html.querySelector('#app-data');
 
-            // Inject current memory state into the DOM clone. Escaping "<" as \u003c
-            // keeps a literal closing script tag inside note content from terminating
-            // the data script tag and corrupting the exported file (JSON.parse still
-            // decodes \u003c transparently).
-            dataScript.textContent = JSON.stringify({ ...store.getState(), savedAt: now() }).replace(/</g, '\\u003c');
+            let payload;
+            try {
+                payload = await buildVaultPayload(store.getState());
+            } catch(err) {
+                await modal.alert({
+                    title: 'Vault is locked',
+                    body: 'Unlock the vault before downloading — otherwise the exported file would not contain any of your notes.'
+                });
+                return;
+            }
+
+            // Escaping "<" as \u003c keeps a literal closing script tag inside note content
+            // from terminating the data script tag and corrupting the exported file
+            // (JSON.parse still decodes \u003c transparently).
+            dataScript.textContent = JSON.stringify(payload).replace(/</g, '\\u003c');
 
             // Strip transient UI so the export is clean; init() re-renders on boot.
             html.querySelector('#tree-container').innerHTML = '';
@@ -625,13 +2025,25 @@
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `notes_v4_${new Date().toISOString().split('T')[0]}.html`;
+            // Include time so exporting twice in one day doesn't silently overwrite.
+            const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            a.download = `notes_v4_${ts}.html`;
             a.click();
             URL.revokeObjectURL(url);
         }
 
         // Global Keyboard Shortcuts
         document.addEventListener('keydown', (e) => {
+            // Manual lock. Encrypted mode is where this matters; in plain mode it's still
+            // available (as a screen-hide), which is at worst harmless.
+            if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+                e.preventDefault();
+                lockApp('manual');
+                return;
+            }
+            // Global shortcuts should not fire while the app is locked — the sidebar and editor
+            // are inert but keydown still bubbles up here.
+            if (isLocked) return;
             if ((e.metaKey || e.ctrlKey) && e.key === 'n') { e.preventDefault(); createNote(); document.getElementById('note-title').focus(); }
             if ((e.metaKey || e.ctrlKey) && e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
             if (e.key === 'Escape') {

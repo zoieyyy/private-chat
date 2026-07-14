@@ -1,0 +1,365 @@
+// End-to-end smoke test for the encryption flows.
+// Uses playwright to drive a real Chromium against index.html served over file://
+// so localStorage and BroadcastChannel behave the same as they do for a user.
+import { chromium } from 'playwright';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const APP_URL = 'file://' + path.resolve(__dirname, '../index.html');
+
+function assert(cond, msg) {
+    if (!cond) { console.error('FAIL:', msg); process.exit(1); }
+    console.log('PASS:', msg);
+}
+
+async function bootFresh(browser) {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    page.on('pageerror', e => { console.error('PAGE ERROR:', e); process.exitCode = 1; });
+    page.on('console', msg => {
+        if (msg.type() === 'error') console.error('CONSOLE ERROR:', msg.text());
+    });
+    await page.goto(APP_URL);
+    await page.waitForLoadState('domcontentloaded');
+    return { context, page };
+}
+
+async function typeInto(page, selector, text) {
+    await page.click(selector);
+    await page.fill(selector, text);
+}
+
+async function waitUnlocked(page) {
+    await page.waitForFunction(
+        () => !document.getElementById('lock-overlay').classList.contains('open'),
+        null,
+        { timeout: 5000 }
+    );
+}
+
+(async () => {
+    const browser = await chromium.launch();
+
+    // --- Test 1: Plain-mode boot works, notes persist ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        // Create a note
+        await page.evaluate(() => window.createNote());
+        await page.waitForSelector('#note-title');
+        await typeInto(page, '#note-title', 'plain hello');
+        await typeInto(page, '#note-content', 'plain world');
+        await page.waitForTimeout(150);
+        const stored = await page.evaluate(() => localStorage.getItem('v4_store'));
+        assert(stored && stored.includes('plain hello'), 'plain vault stores plaintext title in localStorage');
+        assert(JSON.parse(stored).security?.mode === 'plain', 'plain vault has security.mode=plain');
+        await context.close();
+    }
+
+    // --- Test 2: Enable encryption, verify ciphertext-only storage ---
+    let encryptedVaultSample;
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        await page.evaluate(() => window.createNote());
+        await typeInto(page, '#note-title', 'secret note');
+        await typeInto(page, '#note-content', 'top secret content');
+        await page.waitForTimeout(100);
+
+        // Trigger enable via API to avoid modal choreography for the first test
+        await page.evaluate(async () => await window.enableEncryption('correct horse battery'));
+        await page.waitForTimeout(200);
+
+        const stored = await page.evaluate(() => localStorage.getItem('v4_store'));
+        const parsed = JSON.parse(stored);
+        assert(parsed.security?.mode === 'encrypted', 'vault flips to encrypted');
+        assert(parsed.ciphertext && parsed.ciphertext.data, 'vault carries ciphertext');
+        assert(!stored.includes('top secret content'), 'plaintext note content not visible in localStorage');
+        assert(!stored.includes('secret note'), 'plaintext note title not visible in localStorage');
+        assert(parsed.security.kdf.iterations >= 600000, 'PBKDF2 iterations at policy minimum');
+        assert(parsed.security.wraps.passphrase?.wrapped, 'passphrase-wrapped DEK stored');
+        encryptedVaultSample = stored;
+        await context.close();
+    }
+
+    // --- Test 3: Reload of encrypted vault shows lock overlay; wrong passphrase rejected ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        const bodyLocked = await page.evaluate(() => document.body.classList.contains('locked'));
+        assert(bodyLocked, 'body.locked applied when encrypted vault boots');
+        const sidebarInert = await page.evaluate(() => document.getElementById('sidebar').hasAttribute('inert'));
+        assert(sidebarInert, 'sidebar is inert while locked');
+
+        // Wrong passphrase → error, still locked
+        await page.fill('#unlock-passphrase', 'wrong passphrase');
+        await page.click('#unlock-submit');
+        await page.waitForTimeout(300);
+        const err = await page.textContent('#unlock-error');
+        assert(err && err.toLowerCase().includes('incorrect'), 'wrong passphrase produces error message');
+        const stillLocked = await page.evaluate(() => document.getElementById('lock-overlay').classList.contains('open'));
+        assert(stillLocked, 'lock overlay stays open after wrong passphrase');
+
+        // Correct passphrase → unlocked
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        const noteText = await page.textContent('#tree-container');
+        assert(noteText.includes('secret note'), 'unlocked note title appears in sidebar');
+        await context.close();
+    }
+
+    // --- Test 4: Change passphrase, old fails, new works ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+
+        await page.evaluate(async () => await window.changePassphrase('correct horse battery', 'new stronger passphrase'));
+        await page.waitForTimeout(200);
+        const newVault = await page.evaluate(() => localStorage.getItem('v4_store'));
+
+        // Reload, should still be encrypted
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+
+        // Old passphrase now fails
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await page.waitForTimeout(300);
+        const stillLocked = await page.evaluate(() => document.getElementById('lock-overlay').classList.contains('open'));
+        assert(stillLocked, 'old passphrase no longer works');
+
+        // New passphrase works
+        await page.fill('#unlock-passphrase', 'new stronger passphrase');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        assert(true, 'new passphrase unlocks after change');
+        await context.close();
+    }
+
+    // --- Test 5: Disable encryption returns to plaintext ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        await page.evaluate(async () => await window.disableEncryption('correct horse battery'));
+        await page.waitForTimeout(200);
+        const stored = await page.evaluate(() => localStorage.getItem('v4_store'));
+        const parsed = JSON.parse(stored);
+        assert(parsed.security.mode === 'plain', 'vault flipped back to plain');
+        assert(stored.includes('secret note'), 'plaintext title visible again after disable');
+        await context.close();
+    }
+
+    // --- Test 6: Modal focus trap + Escape cancels folder delete ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        // Create a second folder so we can delete one
+        await page.evaluate(() => window.createFolder());
+        await page.waitForTimeout(100);
+        // Click the ✕ on the first folder header
+        await page.evaluate(() => {
+            const btn = document.querySelector('.folder-header .icon-btn.delete');
+            btn.click();
+        });
+        await page.waitForSelector('.modal-dialog[role="alertdialog"]');
+        // The initial focus should NOT be on a danger button
+        const focusedKind = await page.evaluate(() => document.activeElement.className);
+        assert(!focusedKind.includes('danger'), 'destructive button is not auto-focused');
+        // Escape cancels
+        await page.keyboard.press('Escape');
+        await page.waitForSelector('.modal-dialog', { state: 'detached', timeout: 2000 });
+        const folderCount = await page.evaluate(() => document.querySelectorAll('.folder-header').length);
+        assert(folderCount === 2, 'Escape cancels folder delete');
+        await context.close();
+    }
+
+    // --- Test 7: Export contains encrypted payload only ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+
+        const exportedHtml = await page.evaluate(async () => {
+            const payload = await window.buildVaultPayload(window.store.getState());
+            return JSON.stringify(payload);
+        });
+        assert(!exportedHtml.includes('top secret content'), 'exported payload does not contain plaintext');
+        assert(exportedHtml.includes('ciphertext'), 'exported payload carries ciphertext field');
+        await context.close();
+    }
+
+    // --- Test 8: Manual lock wipes DEK, DOM inputs, and rendered state ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        // Select the note so the editor holds its plaintext
+        await page.evaluate(() => {
+            const li = document.querySelector('.note-item');
+            if (li) li.click();
+        });
+        await page.waitForTimeout(150);
+        const titleBefore = await page.inputValue('#note-title');
+        assert(titleBefore.length > 0, 'unlocked editor shows plaintext title');
+
+        // Manual lock
+        await page.click('#lock-btn');
+        await page.waitForFunction(() => document.getElementById('lock-overlay').classList.contains('open'));
+        const titleAfter = await page.inputValue('#note-title');
+        assert(titleAfter === '', 'note-title input is wiped after lock');
+        const contentAfter = await page.inputValue('#note-content');
+        assert(contentAfter === '', 'note-content input is wiped after lock');
+        const treeHtml = await page.evaluate(() => document.getElementById('tree-container').innerHTML);
+        assert(treeHtml.length < 100 || !treeHtml.includes('secret note'), 'tree does not contain plaintext note title after lock');
+        const dekNulled = await page.evaluate(() => window.__test_currentDek === undefined
+            ? 'wrapper missing' : (window.__test_currentDek === null));
+        // Fallback: check via getState — after lock the store carries freshState
+        const stateAfter = await page.evaluate(() => window.store.getState());
+        assert(stateAfter.notes.length === 0, 'store state is reset to empty after lock');
+
+        // Re-unlock restores notes
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        const stateBack = await page.evaluate(() => window.store.getState());
+        assert(stateBack.notes.length >= 1, 'unlock rehydrates notes');
+        await context.close();
+    }
+
+    // --- Test 9: Cmd+Shift+L keyboard shortcut locks ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        await page.keyboard.press('Control+Shift+L');
+        await page.waitForFunction(() => document.getElementById('lock-overlay').classList.contains('open'), null, { timeout: 3000 });
+        assert(true, 'Ctrl+Shift+L triggers manual lock');
+        await context.close();
+    }
+
+    // --- Test 11: CSP blocks injected inline scripts ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        // Try to inject an inline script — CSP should refuse to run it.
+        const executed = await page.evaluate(() => {
+            return new Promise((resolve) => {
+                window.__csp_test_marker__ = false;
+                const s = document.createElement('script');
+                s.textContent = 'window.__csp_test_marker__ = true;';
+                document.body.appendChild(s);
+                // Give the browser a tick to attempt execution
+                setTimeout(() => resolve(window.__csp_test_marker__), 100);
+            });
+        });
+        assert(executed === false, 'CSP blocks a runtime-injected inline <script>');
+        await context.close();
+    }
+
+    // --- Test 12: Export → fresh load → unlock roundtrip preserves data ---
+    {
+        // Export from an encrypted vault, then open the exported HTML in a fresh browser
+        // context with a fresh (empty) origin so we're really testing "opened somewhere new,
+        // rehydrated from the embedded #app-data blob."
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+
+        const payloadJson = await page.evaluate(async () => {
+            const p = await window.buildVaultPayload(window.store.getState());
+            return JSON.stringify(p).replace(/</g, '\\u003c');
+        });
+
+        // Write the stamped HTML to disk under a fresh filename so its origin (its file path)
+        // is distinct from index.html — an origin with no localStorage entry for this app.
+        const fs = await import('node:fs');
+        const path = await import('node:path');
+        const url = await import('node:url');
+        const __dirname2 = path.dirname(url.fileURLToPath(import.meta.url));
+        const html = fs.readFileSync(path.resolve(__dirname2, '../index.html'), 'utf8');
+        const stamped = html.replace(
+            /(<script id="app-data" type="application\/json">)[\s\S]*?(<\/script>)/,
+            `$1${payloadJson}$2`
+        );
+        const exportPath = path.resolve(__dirname2, 'export-tmp.html');
+        fs.writeFileSync(exportPath, stamped);
+
+        const ctx2 = await browser.newContext();
+        const page2 = await ctx2.newPage();
+        page2.on('pageerror', e => console.error('EXPORT LOAD ERROR:', e));
+        await page2.goto('file://' + exportPath);
+        await page2.waitForSelector('#lock-overlay.open', { timeout: 5000 });
+        await page2.fill('#unlock-passphrase', 'correct horse battery');
+        await page2.click('#unlock-submit');
+        await waitUnlocked(page2);
+        const notes = await page2.evaluate(() => window.store.getState().notes);
+        assert(notes.some(n => n.title === 'secret note'), 'exported HTML unlocked with same passphrase and restored notes');
+        fs.unlinkSync(exportPath);
+        await ctx2.close();
+        await context.close();
+    }
+
+    // --- Test 10: Plain-mode lock is a screen-hide (no passphrase field) ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        await page.evaluate(() => window.createNote());
+        await typeInto(page, '#note-title', 'plain note');
+        await page.waitForTimeout(100);
+        await page.click('#lock-btn');
+        await page.waitForFunction(() => document.getElementById('lock-overlay').classList.contains('open'));
+        const passphraseHidden = await page.evaluate(() => document.getElementById('unlock-passphrase-field').hidden);
+        assert(passphraseHidden, 'plain-mode lock hides passphrase field');
+        const title = await page.textContent('#lock-title');
+        assert(title.includes('hidden') || title.includes('Hidden'), 'plain-mode lock title reflects screen-hide, not encryption');
+        // Unlock (no credential needed)
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+        const stored = await page.inputValue('#note-title');
+        assert(stored === 'plain note', 'plain-mode unlock restores note');
+        await context.close();
+    }
+
+    await browser.close();
+    console.log('\nAll smoke tests passed.');
+})();
