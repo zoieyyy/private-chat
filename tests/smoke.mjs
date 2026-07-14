@@ -269,6 +269,74 @@ async function waitUnlocked(page) {
         await context.close();
     }
 
+    // --- Test 11: CSP blocks injected inline scripts ---
+    {
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate(() => localStorage.clear());
+        await page.reload();
+        await page.waitForSelector('#sidebar');
+        // Try to inject an inline script — CSP should refuse to run it.
+        const executed = await page.evaluate(() => {
+            return new Promise((resolve) => {
+                window.__csp_test_marker__ = false;
+                const s = document.createElement('script');
+                s.textContent = 'window.__csp_test_marker__ = true;';
+                document.body.appendChild(s);
+                // Give the browser a tick to attempt execution
+                setTimeout(() => resolve(window.__csp_test_marker__), 100);
+            });
+        });
+        assert(executed === false, 'CSP blocks a runtime-injected inline <script>');
+        await context.close();
+    }
+
+    // --- Test 12: Export → fresh load → unlock roundtrip preserves data ---
+    {
+        // Export from an encrypted vault, then open the exported HTML in a fresh browser
+        // context with a fresh (empty) origin so we're really testing "opened somewhere new,
+        // rehydrated from the embedded #app-data blob."
+        const { context, page } = await bootFresh(browser);
+        await page.evaluate((v) => localStorage.setItem('v4_store', v), encryptedVaultSample);
+        await page.reload();
+        await page.waitForSelector('#lock-overlay.open');
+        await page.fill('#unlock-passphrase', 'correct horse battery');
+        await page.click('#unlock-submit');
+        await waitUnlocked(page);
+
+        const payloadJson = await page.evaluate(async () => {
+            const p = await window.buildVaultPayload(window.store.getState());
+            return JSON.stringify(p).replace(/</g, '\\u003c');
+        });
+
+        // Write the stamped HTML to disk under a fresh filename so its origin (its file path)
+        // is distinct from index.html — an origin with no localStorage entry for this app.
+        const fs = await import('node:fs');
+        const path = await import('node:path');
+        const url = await import('node:url');
+        const __dirname2 = path.dirname(url.fileURLToPath(import.meta.url));
+        const html = fs.readFileSync(path.resolve(__dirname2, '../index.html'), 'utf8');
+        const stamped = html.replace(
+            /(<script id="app-data" type="application\/json">)[\s\S]*?(<\/script>)/,
+            `$1${payloadJson}$2`
+        );
+        const exportPath = path.resolve(__dirname2, 'export-tmp.html');
+        fs.writeFileSync(exportPath, stamped);
+
+        const ctx2 = await browser.newContext();
+        const page2 = await ctx2.newPage();
+        page2.on('pageerror', e => console.error('EXPORT LOAD ERROR:', e));
+        await page2.goto('file://' + exportPath);
+        await page2.waitForSelector('#lock-overlay.open', { timeout: 5000 });
+        await page2.fill('#unlock-passphrase', 'correct horse battery');
+        await page2.click('#unlock-submit');
+        await waitUnlocked(page2);
+        const notes = await page2.evaluate(() => window.store.getState().notes);
+        assert(notes.some(n => n.title === 'secret note'), 'exported HTML unlocked with same passphrase and restored notes');
+        fs.unlinkSync(exportPath);
+        await ctx2.close();
+        await context.close();
+    }
+
     // --- Test 10: Plain-mode lock is a screen-hide (no passphrase field) ---
     {
         const { context, page } = await bootFresh(browser);

@@ -3,6 +3,21 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!--
+      Content Security Policy.
+      - No 'unsafe-inline' on script-src. Inline event handlers were moved to addEventListener.
+      - The one inline JS block is allowed only via its SHA-256 hash (below); modifying it
+        means recomputing the hash via `node tools/compute-csp-hash.mjs`. Both live-served
+        and exported HTML carry the same policy (exports are static copies of this file),
+        so an exported HTML tampered with in transit will refuse to execute injected code.
+      - style-src allows 'unsafe-inline' because inline styles are pervasive throughout the
+        app and, per the spec, are a much smaller attack surface than inline script.
+      - connect-src 'none': the app makes no network requests. localStorage, BroadcastChannel,
+        and navigator.credentials aren't subject to connect-src.
+      - frame-ancestors is header-only; it's applied via server config, not meta.
+      - object/base locked down to prevent embedding attacks and base tricks.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-gxwbItViGI8mQe/Tvk8hjzN8s2NiKUWE0QNT++qt28o='; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'">
     <title>Notes: File-Over-App</title>
     <style>
         :root[data-theme="light"] {
@@ -216,16 +231,16 @@
             <div class="header-top">
                 <h3>Workspace</h3>
                 <div class="action-group">
-                    <button onclick="createFolder()">+ Folder</button>
-                    <button onclick="createNote()" style="background: var(--primary); color: white; border: none;">+ Note</button>
+                    <button id="new-folder-btn">+ Folder</button>
+                    <button id="new-note-btn" style="background: var(--primary); color: white; border: none;">+ Note</button>
                 </div>
             </div>
-            <input type="text" id="search-input" class="search-box" placeholder="Search (Cmd+/)..." oninput="handleSearch()">
+            <input type="text" id="search-input" class="search-box" placeholder="Search (Cmd+/)...">
             <div class="action-group" style="margin-top: 8px; display: flex; gap: 4px; flex-wrap: wrap;">
-                <button onclick="exportSelfContainedHtml()">Download App</button>
-                <button id="theme-toggle" onclick="toggleTheme()">Dark Mode</button>
-                <button id="security-btn" onclick="openSecurityPanel()">Security</button>
-                <button id="lock-btn" onclick="lockApp('manual')" title="Lock (Cmd+Shift+L)">Lock</button>
+                <button id="export-btn">Download App</button>
+                <button id="theme-toggle">Dark Mode</button>
+                <button id="security-btn">Security</button>
+                <button id="lock-btn" title="Lock (Cmd+Shift+L)">Lock</button>
             </div>
         </div>
         <div id="tree-container"></div>
@@ -240,18 +255,18 @@
         <div id="editor-view">
             <div class="editor-card">
                 <div class="editor-top-bar">
-                    <select id="folder-select" class="folder-select" onchange="moveNote()"></select>
+                    <select id="folder-select" class="folder-select"></select>
                     <div style="display: flex; gap: 10px; align-items: center;">
-                        <label><input type="checkbox" id="preview-toggle" onchange="togglePreview()"> Preview</label>
+                        <label><input type="checkbox" id="preview-toggle"> Preview</label>
                         <span id="save-status">Saved</span>
                     </div>
                 </div>
-                <input type="text" id="note-title" placeholder="Note Title" oninput="handleInput()">
-                <textarea id="note-content" placeholder="Start typing (Markdown supported)..." oninput="handleInput()"></textarea>
+                <input type="text" id="note-title" placeholder="Note Title">
+                <textarea id="note-content" placeholder="Start typing (Markdown supported)..."></textarea>
                 <div id="preview-layer"></div>
                 <div class="editor-footer">
                     <span id="word-count">0 words</span>
-                    <button onclick="softDeleteActiveNote()">Delete Note</button>
+                    <button id="delete-note-btn">Delete Note</button>
                 </div>
             </div>
         </div>
@@ -259,7 +274,7 @@
 
     <div id="toast">
         <span id="toast-msg">Note deleted.</span>
-        <button onclick="undoDelete()">Undo</button>
+        <button id="undo-delete-btn">Undo</button>
     </div>
 
     <div id="modal-root" aria-hidden="true"></div>
@@ -375,6 +390,17 @@
         // hand the app a decrypted state or a lock screen.
         const VAULT_KEY = 'v4_store';
         const VAULT_VERSION = 1;
+
+        // Some sandboxed contexts (data: URIs, some private-mode configurations, some CSP
+        // sandboxes) throw SecurityError on the mere property access `window.localStorage`.
+        // Wrap every read/write so the app keeps working from an embedded #app-data payload
+        // even when local persistence is unavailable — that's exactly the "opened an exported
+        // file in a fresh location" scenario the export flow is designed to support.
+        const safeStorage = {
+            get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+            set(key, value) { try { localStorage.setItem(key, value); } catch {} },
+            remove(key) { try { localStorage.removeItem(key); } catch {} }
+        };
 
         function freshState() {
             return { folders: [{ id: generateId(), name: "General", isExpanded: true }], notes: [], activeNoteId: null, searchQuery: '' };
@@ -877,6 +903,26 @@
             saveToStorage(store.getState());
         }
 
+        // Bind all previously-inline event handlers via addEventListener so we can drop
+        // 'unsafe-inline' from script-src. Called once from init(). Icons that live inside
+        // dynamically-rendered trees (folder headers, note items) already use JS listeners,
+        // so this only needs to cover the static shell.
+        function bindStaticListeners() {
+            document.getElementById('new-folder-btn').addEventListener('click', () => createFolder());
+            document.getElementById('new-note-btn').addEventListener('click', () => createNote());
+            document.getElementById('search-input').addEventListener('input', handleSearch);
+            document.getElementById('export-btn').addEventListener('click', () => exportSelfContainedHtml());
+            document.getElementById('theme-toggle').addEventListener('click', () => toggleTheme());
+            document.getElementById('security-btn').addEventListener('click', () => openSecurityPanel());
+            document.getElementById('lock-btn').addEventListener('click', () => lockApp('manual'));
+            document.getElementById('folder-select').addEventListener('change', moveNote);
+            document.getElementById('preview-toggle').addEventListener('change', togglePreview);
+            document.getElementById('note-title').addEventListener('input', handleInput);
+            document.getElementById('note-content').addEventListener('input', handleInput);
+            document.getElementById('delete-note-btn').addEventListener('click', () => softDeleteActiveNote());
+            document.getElementById('undo-delete-btn').addEventListener('click', () => undoDelete());
+        }
+
         function bindUnlockForm() {
             const form = document.getElementById('unlock-form');
             const errEl = document.getElementById('unlock-error');
@@ -956,12 +1002,12 @@
         ];
 
         function getAutoLockMs() {
-            const v = parseInt(localStorage.getItem(AUTO_LOCK_KEY), 10);
+            const v = parseInt(safeStorage.get(AUTO_LOCK_KEY), 10);
             if (Number.isFinite(v) && v >= 0) return v;
             return AUTO_LOCK_DEFAULT_MS;
         }
         function setAutoLockMs(ms) {
-            localStorage.setItem(AUTO_LOCK_KEY, String(ms));
+            safeStorage.set(AUTO_LOCK_KEY, String(ms));
             resetIdleTimer();
         }
 
@@ -1570,6 +1616,7 @@
             // with an empty shell so subscribers and renderers don't have to special-case null.
             let initialState = boot.state ? sanitizeState(boot.state) : freshState();
 
+            bindStaticListeners();
             bindUnlockForm();
             installActivityListeners();
             if (boot.locked) {
@@ -1603,7 +1650,7 @@
 
             // Initial render
             const state = store.getState();
-            if (localStorage.getItem('v4_theme') === 'dark') toggleTheme(true);
+            if (safeStorage.get('v4_theme') === 'dark') toggleTheme(true);
             renderTree(state);
             patchEditorState(state);
 
@@ -1915,7 +1962,7 @@
         function toggleTheme(forceDark) {
             const isDark = typeof forceDark === 'boolean' ? forceDark : document.documentElement.getAttribute('data-theme') === 'light';
             document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
-            localStorage.setItem('v4_theme', isDark ? 'dark' : 'light');
+            safeStorage.set('v4_theme', isDark ? 'dark' : 'light');
             document.getElementById('theme-toggle').textContent = isDark ? 'Light Mode' : 'Dark Mode';
         }
 
